@@ -1,0 +1,68 @@
+{
+  "name": "@btoon/js",
+  "version": "0.0.1",
+  "description": "BTOON binary serialization for JavaScript (Browser/WebAssembly)",
+  "main": "dist/btoon.js",
+  "module": "dist/btoon.mjs",
+  "types": "dist/btoon.d.ts",
+  "unpkg": "dist/btoon.min.js",
+  "files": [
+    "dist",
+    "src",
+    "wasm"
+  ],
+  "scripts": {
+    "build": "npm run build:wasm && npm run build:js",
+    "build:wasm": "emcc src/btoon_wasm.cpp -o wasm/btoon.js -s MODULARIZE=1 -s EXPORT_NAME='BTOONModule' -s WASM=1 -s ALLOW_MEMORY_GROWTH=1",
+    "build:js": "rollup -c",
+    "build:prod": "npm run build && npm run minify",
+    "minify": "terser dist/btoon.js -o dist/btoon.min.js --compress --mangle",
+    "test": "jest",
+    "test:browser": "karma start",
+    "lint": "eslint src/**/*.js",
+    "format": "prettier --write src/**/*.js",
+    "prepublishOnly": "npm run build:prod && npm test",
+    "dev": "rollup -c -w",
+    "serve": "serve . -p 8080"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BTOON-project/btoon-javascript.git"
+  },
+  "keywords": [
+    "btoon",
+    "binary",
+    "serialization",
+    "wasm",
+    "webassembly",
+    "messagepack",
+    "encoding",
+    "browser"
+  ],
+  "author": "BTOON Contributors",
+  "license": "MIT",
+  "homepage": "https://btoon.net",
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^24.0.0",
+    "@rollup/plugin-node-resolve": "^15.0.0",
+    "@rollup/plugin-typescript": "^11.0.0",
+    "@types/emscripten": "^1.39.0",
+    "eslint": "^8.50.0",
+    "jest": "^29.7.0",
+    "karma": "^6.4.0",
+    "karma-chrome-launcher": "^3.2.0",
+    "karma-jasmine": "^5.1.0",
+    "prettier": "^3.0.0",
+    "rollup": "^3.29.0",
+    "serve": "^14.2.0",
+    "terser": "^5.20.0",
+    "typescript": "^5.2.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "browser": {
+    "fs": false,
+    "path": false
+  }
+}

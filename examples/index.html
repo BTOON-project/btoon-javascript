@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BTOON JavaScript Examples</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        h1 {
+            color: #333;
+            border-bottom: 3px solid #4CAF50;
+            padding-bottom: 10px;
+        }
+        .example {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .example h2 {
+            color: #4CAF50;
+            margin-top: 0;
+        }
+        button {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            margin: 5px;
+        }
+        button:hover {
+            background: #45a049;
+        }
+        pre {
+            background: #f4f4f4;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 10px;
+            overflow-x: auto;
+        }
+        .output {
+            background: #e8f5e9;
+            border: 1px solid #4CAF50;
+            border-radius: 4px;
+            padding: 10px;
+            margin-top: 10px;
+            min-height: 50px;
+        }
+        .performance {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 10px;
+            margin-top: 10px;
+        }
+        .metric {
+            background: #fff3e0;
+            padding: 10px;
+            border-radius: 4px;
+            text-align: center;
+        }
+        .metric-value {
+            font-size: 24px;
+            font-weight: bold;
+            color: #ff6f00;
+        }
+    </style>
+</head>
+<body>
+    <h1>🚀 BTOON JavaScript Examples</h1>
+    
+    <div class="example">
+        <h2>1. Basic Encoding/Decoding</h2>
+        <button onclick="runBasicExample()">Run Example</button>
+        <pre id="basic-code">
+const data = {
+    message: 'Hello, BTOON!',
+    count: 42,
+    pi: 3.14159,
+    active: true,
+    tags: ['fast', 'compact', 'typed']
+};
+
+const encoded = BTOON.encode(data);
+const decoded = BTOON.decode(encoded);
+        </pre>
+        <div id="basic-output" class="output"></div>
+    </div>
+    
+    <div class="example">
+        <h2>2. Performance Comparison</h2>
+        <button onclick="runPerformanceTest()">Run Benchmark</button>
+        <div id="perf-output" class="output">
+            <div class="performance">
+                <div class="metric">
+                    <div>JSON Encode</div>
+                    <div class="metric-value" id="json-encode">-</div>
+                </div>
+                <div class="metric">
+                    <div>BTOON Encode</div>
+                    <div class="metric-value" id="btoon-encode">-</div>
+                </div>
+                <div class="metric">
+                    <div>JSON Size</div>
+                    <div class="metric-value" id="json-size">-</div>
+                </div>
+                <div class="metric">
+                    <div>BTOON Size</div>
+                    <div class="metric-value" id="btoon-size">-</div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="example">
+        <h2>3. Large Dataset</h2>
+        <button onclick="runLargeDataset()">Generate & Encode</button>
+        <div id="large-output" class="output"></div>
+    </div>
+    
+    <div class="example">
+        <h2>4. Type Preservation</h2>
+        <button onclick="runTypeTest()">Test Types</button>
+        <div id="type-output" class="output"></div>
+    </div>
+    
+    <div class="example">
+        <h2>5. Binary Data</h2>
+        <button onclick="runBinaryTest()">Test Binary</button>
+        <div id="binary-output" class="output"></div>
+    </div>
+    
+    <script src="../dist/btoon.js"></script>
+    <script>
+        // Initialize BTOON
+        BTOON.init().then(() => {
+            console.log('BTOON initialized, WASM:', BTOON.hasWASM());
+            document.getElementById('basic-output').innerHTML = 
+                `BTOON loaded! Version: ${BTOON.VERSION}<br>` +
+                `WebAssembly: ${BTOON.hasWASM() ? '✅ Available' : '❌ Not available (using pure JS)'}`;
+        });
+        
+        function runBasicExample() {
+            const data = {
+                message: 'Hello, BTOON!',
+                count: 42,
+                pi: 3.14159,
+                active: true,
+                tags: ['fast', 'compact', 'typed']
+            };
+            
+            const encoded = BTOON.encode(data);
+            const decoded = BTOON.decode(encoded);
+            
+            document.getElementById('basic-output').innerHTML = `
+                <strong>Original:</strong> ${JSON.stringify(data, null, 2)}<br><br>
+                <strong>Encoded size:</strong> ${encoded.length} bytes<br>
+                <strong>Encoded (hex):</strong> ${Array.from(encoded.slice(0, 20)).map(b => b.toString(16).padStart(2, '0')).join(' ')}...<br><br>
+                <strong>Decoded:</strong> ${JSON.stringify(decoded, null, 2)}<br>
+                <strong>Match:</strong> ${JSON.stringify(data) === JSON.stringify(decoded) ? '✅ Perfect' : '❌ Mismatch'}
+            `;
+        }
+        
+        function runPerformanceTest() {
+            const data = [];
+            for (let i = 0; i < 1000; i++) {
+                data.push({
+                    id: i,
+                    name: `User ${i}`,
+                    email: `user${i}@example.com`,
+                    score: Math.random() * 100,
+                    active: i % 2 === 0
+                });
+            }
+            
+            // JSON encoding
+            const jsonStart = performance.now();
+            const jsonStr = JSON.stringify(data);
+            const jsonTime = performance.now() - jsonStart;
+            
+            // BTOON encoding
+            const btoonStart = performance.now();
+            const btoonData = BTOON.encode(data);
+            const btoonTime = performance.now() - btoonStart;
+            
+            // Update display
+            document.getElementById('json-encode').textContent = jsonTime.toFixed(2) + ' ms';
+            document.getElementById('btoon-encode').textContent = btoonTime.toFixed(2) + ' ms';
+            document.getElementById('json-size').textContent = (jsonStr.length / 1024).toFixed(1) + ' KB';
+            document.getElementById('btoon-size').textContent = (btoonData.length / 1024).toFixed(1) + ' KB';
+            
+            // Color code based on performance
+            const btoonFaster = btoonTime < jsonTime;
+            document.getElementById('btoon-encode').style.color = btoonFaster ? '#4CAF50' : '#f44336';
+            
+            const btoonSmaller = btoonData.length < jsonStr.length;
+            document.getElementById('btoon-size').style.color = btoonSmaller ? '#4CAF50' : '#f44336';
+        }
+        
+        function runLargeDataset() {
+            const output = document.getElementById('large-output');
+            output.innerHTML = 'Generating large dataset...';
+            
+            // Generate large nested structure
+            const large = {
+                metadata: {
+                    version: '1.0',
+                    timestamp: new Date().toISOString()
+                },
+                users: [],
+                statistics: {
+                    total: 0,
+                    active: 0,
+                    inactive: 0
+                }
+            };
+            
+            for (let i = 0; i < 5000; i++) {
+                const user = {
+                    id: i,
+                    username: `user_${i}`,
+                    profile: {
+                        firstName: `First${i}`,
+                        lastName: `Last${i}`,
+                        age: 20 + (i % 50),
+                        tags: ['tag1', 'tag2', 'tag3']
+                    }
+                };
+                large.users.push(user);
+                large.statistics.total++;
+                if (i % 2 === 0) large.statistics.active++;
+                else large.statistics.inactive++;
+            }
+            
+            const encoded = BTOON.encode(large);
+            const jsonSize = JSON.stringify(large).length;
+            
+            output.innerHTML = `
+                <strong>Dataset:</strong> ${large.users.length} users<br>
+                <strong>JSON size:</strong> ${(jsonSize / 1024).toFixed(1)} KB<br>
+                <strong>BTOON size:</strong> ${(encoded.length / 1024).toFixed(1)} KB<br>
+                <strong>Compression ratio:</strong> ${((1 - encoded.length / jsonSize) * 100).toFixed(1)}%<br>
+                <strong>Decode test:</strong> ${(() => {
+                    try {
+                        const decoded = BTOON.decode(encoded);
+                        return decoded.users.length === large.users.length ? '✅ Success' : '❌ Failed';
+                    } catch (e) {
+                        return '❌ Error: ' + e.message;
+                    }
+                })()}
+            `;
+        }
+        
+        function runTypeTest() {
+            const types = {
+                null: null,
+                undefined: undefined,
+                boolean_true: true,
+                boolean_false: false,
+                integer: 42,
+                negative: -123,
+                float: 3.14159,
+                bigNumber: Number.MAX_SAFE_INTEGER,
+                string: "Hello, World!",
+                unicode: "你好世界 🌍",
+                array: [1, 2, 3],
+                object: { nested: { value: 123 } },
+                date: new Date().toISOString()
+            };
+            
+            const encoded = BTOON.encode(types);
+            const decoded = BTOON.decode(encoded);
+            
+            let results = '<strong>Type Preservation Test:</strong><br><br>';
+            for (const [key, value] of Object.entries(types)) {
+                const decodedValue = decoded[key];
+                const match = JSON.stringify(value) === JSON.stringify(decodedValue);
+                results += `${key}: ${match ? '✅' : '❌'} ` +
+                          `(${typeof value} → ${typeof decodedValue})<br>`;
+            }
+            
+            document.getElementById('type-output').innerHTML = results;
+        }
+        
+        function runBinaryTest() {
+            // Create binary data
+            const binaryArray = new Uint8Array([0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0xFF]);
+            
+            const data = {
+                text: "Binary test",
+                binary: binaryArray,
+                mixed: [
+                    "string",
+                    123,
+                    new Uint8Array([1, 2, 3, 4, 5])
+                ]
+            };
+            
+            const encoded = BTOON.encode(data);
+            const decoded = BTOON.decode(encoded);
+            
+            let output = '<strong>Binary Data Test:</strong><br><br>';
+            output += `Original binary: [${Array.from(binaryArray).map(b => '0x' + b.toString(16).toUpperCase()).join(', ')}]<br>`;
+            
+            if (decoded.binary instanceof Uint8Array) {
+                const decodedBinary = Array.from(decoded.binary);
+                const match = decodedBinary.every((v, i) => v === binaryArray[i]);
+                output += `Decoded binary: [${decodedBinary.map(b => '0x' + b.toString(16).toUpperCase()).join(', ')}]<br>`;
+                output += `Binary preserved: ${match ? '✅ Yes' : '❌ No'}<br>`;
+            } else {
+                output += `Decoded binary: ❌ Not Uint8Array<br>`;
+            }
+            
+            document.getElementById('binary-output').innerHTML = output;
+        }
+    </script>
+</body>
+</html>
