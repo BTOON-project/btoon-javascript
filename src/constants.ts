@@ -1,5 +1,5 @@
 /** Version of this library. */
-export const VERSION = '0.1.0' as const;
+export const VERSION = '0.1.1' as const;
 
 /** Version of the BTOON specification this library implements. */
 export const SPEC_VERSION = '0.1' as const;

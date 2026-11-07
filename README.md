@@ -17,7 +17,7 @@ compression envelope and an optional HMAC-signed envelope.
   the input justifies, strict UTF-8, duplicate-key rejection, capped decompression, and
   signatures verified before anything is parsed.
 
-Version 0.1.0, implementing spec 0.1. In Node.js it is also the fastest BTOON package: on
+Implements spec 0.1. In Node.js it is also the fastest BTOON package: on
 10,000 records it encodes in 1.1 ms and decodes in 1.6 ms, against 7.8 ms and 7.1 ms for
 the native [`btoon`](https://github.com/BTOON-project/btoon-nodejs) addon, with
 byte-identical output.
@@ -183,7 +183,7 @@ Notes:
 ## API
 
 ```ts
-const VERSION: '0.1.0';
+const VERSION: '0.1.1';
 const SPEC_VERSION: '0.1';
 
 function encode(value: unknown, options?: EncodeOptions): Uint8Array;

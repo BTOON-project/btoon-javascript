@@ -19,7 +19,7 @@ import {
   type EncodeOptions,
 } from '@btoon/js';
 
-const version: '0.1.0' = VERSION;
+const version: '0.1.1' = VERSION;
 const spec: '0.1' = SPEC_VERSION;
 
 const bytes: Uint8Array<ArrayBuffer> = encode({ a: 1, b: [true, null], when: new Date() });
