@@ -1,4 +1,10 @@
-import { ALGORITHM_NAMES, DEFAULT_MAX_DECOMPRESSED_SIZE, DEFAULT_MAX_DEPTH } from './constants.js';
+import {
+  ALGORITHM_NAMES,
+  DEFAULT_MAX_DECOMPRESSED_SIZE,
+  DEFAULT_MAX_DEPTH,
+  DEFAULT_MAX_VALUES,
+  MAX_DEPTH_LIMIT,
+} from './constants.js';
 import { fail } from './errors.js';
 import { isWellFormed } from './utf8.js';
 import { isUint8Array } from './values.js';
@@ -41,9 +47,15 @@ export interface EncodeOptions {
   compression?: CompressionAlgorithm;
   /** Use the tabular (columnar) encoding where SPEC §5.6.2's size rule says so. Default `true`. */
   autoTabular?: boolean;
-  /** Maximum container nesting; deeper or cyclic values throw `max_depth`. Default `128`. */
+  /**
+   * Maximum container nesting; deeper or cyclic values throw `max_depth`. Default `128`, at
+   * most `1000` (a larger value throws `invalid_argument`).
+   */
   maxDepth?: number;
-  /** Sign the output with HMAC-SHA256 (SPEC §8). A string is used as its UTF-8 bytes. Must not be empty. */
+  /**
+   * Sign the output with HMAC-SHA256 (SPEC §8). A string is used as its UTF-8 bytes. An empty
+   * key, or `null`, throws `invalid_argument`: leave the option out for no signature.
+   */
   hmacKey?: Uint8Array | string;
   /** Caller-supplied compression codecs. */
   codecs?: CodecRegistry;
@@ -53,17 +65,37 @@ export interface EncodeOptions {
 export interface DecodeOptions {
   /**
    * SPEC §7 strict mode. Default `true`. Non-strict mode allows trailing bytes and
-   * duplicate keys (last wins) and replaces invalid UTF-8 with U+FFFD; bounds, depth and
-   * allocation checks are never relaxed.
+   * duplicate keys (last wins), and replaces invalid UTF-8 in string values with U+FFFD.
+   * Map keys and column names must be valid UTF-8 in both modes, and no bounds, depth,
+   * size, allocation or other structural check is relaxed.
    */
   strict?: boolean;
-  /** Maximum container nesting; deeper input throws `max_depth`. Default `128`. */
+  /**
+   * Maximum container nesting; deeper input throws `max_depth`. A tabular array counts two
+   * levels. Default `128`, at most `1000` (a larger value throws `invalid_argument`).
+   */
   maxDepth?: number;
-  /** Largest accepted `uncompressed_size` of a compression envelope, in bytes. Default 256 MiB. */
+  /**
+   * Largest accepted `uncompressed_size` of a compression envelope, in bytes, checked before
+   * decompressing. It also bounds the column-name bytes a tabular array copies into its rows
+   * (rows × the names' UTF-8 bytes). Exceeding it throws `size_limit`. Default 64 MiB
+   * (67,108,864).
+   */
   maxDecompressedSize?: number;
+  /**
+   * Largest number of values a document may decode to (SPEC §7.1); more throw `size_limit`.
+   * Every value counts once, when it starts: the top-level value, array elements, map values
+   * (not keys), and extension values. A tabular array counts itself, then its rows once its
+   * header is checked, then each cell. Values inside a compression envelope count. Default
+   * 1,048,576 (2^20); raise it to decode larger documents.
+   */
+  maxValues?: number;
   /** Accept compression envelopes. Default `true`; when `false` they throw `invalid_envelope`. */
   autoDecompress?: boolean;
-  /** Require a signed envelope and verify it (SPEC §8) before parsing. Must not be empty. */
+  /**
+   * Require a signed envelope and verify it (SPEC §8) before parsing. An empty key, or
+   * `null`, throws `invalid_argument`: leave the option out for no key.
+   */
   hmacKey?: Uint8Array | string;
   /**
    * How timestamp (-1), date (-2) and datetime (-3) values decode. `'date'` (default):
@@ -94,6 +126,7 @@ export interface DecodeConfig {
   strict: boolean;
   maxDepth: number;
   maxDecompressedSize: number;
+  maxValues: number;
   autoDecompress: boolean;
   hmacKey: Uint8Array | undefined;
   timestampObjects: boolean;
@@ -114,6 +147,7 @@ const DEFAULT_DECODE: DecodeConfig = Object.freeze({
   strict: true,
   maxDepth: DEFAULT_MAX_DEPTH,
   maxDecompressedSize: DEFAULT_MAX_DECOMPRESSED_SIZE,
+  maxValues: DEFAULT_MAX_VALUES,
   autoDecompress: true,
   hmacKey: undefined,
   timestampObjects: false,
@@ -143,6 +177,13 @@ function count(o: Record<string, unknown>, name: string, dflt: number): number {
   return v;
 }
 
+/** `maxDepth`: a count no larger than SPEC §7's ceiling, so the stack can't be exhausted. */
+function depth(o: Record<string, unknown>): number {
+  const v = count(o, 'maxDepth', DEFAULT_MAX_DEPTH);
+  if (v > MAX_DEPTH_LIMIT) throw fail('invalid_argument', `option maxDepth must be at most ${MAX_DEPTH_LIMIT}, got ${v}`);
+  return v;
+}
+
 function oneOf<T extends string>(o: Record<string, unknown>, name: string, allowed: readonly T[], dflt: T): T {
   const v = o[name];
   if (v === undefined) return dflt;
@@ -152,9 +193,15 @@ function oneOf<T extends string>(o: Record<string, unknown>, name: string, allow
   return v as T;
 }
 
+/**
+ * SPEC §8: "no key" is only an absent (undefined) option. An empty key, or null, is a
+ * configuration error, so that a key read from an empty file or variable can't silently
+ * turn signing or verification off.
+ */
 function hmacKey(o: Record<string, unknown>): Uint8Array | undefined {
   const v = o.hmacKey;
   if (v === undefined) return undefined;
+  if (v === null) throw fail('invalid_argument', 'option hmacKey is null; leave it undefined for no key');
   let key: Uint8Array;
   if (typeof v === 'string') {
     if (!isWellFormed(v)) throw fail('invalid_argument', 'hmacKey string contains a lone surrogate');
@@ -164,7 +211,7 @@ function hmacKey(o: Record<string, unknown>): Uint8Array | undefined {
   } else {
     throw fail('invalid_argument', 'option hmacKey must be a Uint8Array or a string');
   }
-  if (key.length === 0) throw fail('invalid_argument', 'option hmacKey must not be empty');
+  if (key.length === 0) throw fail('invalid_argument', 'option hmacKey is empty; leave it undefined for no key');
   return key;
 }
 
@@ -193,7 +240,7 @@ export function encodeConfig(options: EncodeOptions | undefined): EncodeConfig {
     compress: bool(o, 'compress', false),
     algorithm: oneOf(o, 'compression', ALGORITHM_NAMES, 'zlib'),
     autoTabular: bool(o, 'autoTabular', true),
-    maxDepth: count(o, 'maxDepth', DEFAULT_MAX_DEPTH),
+    maxDepth: depth(o),
     hmacKey: hmacKey(o),
     codecs: codecs(o),
   };
@@ -204,8 +251,9 @@ export function decodeConfig(options: DecodeOptions | undefined): DecodeConfig {
   if (o === undefined) return DEFAULT_DECODE;
   return {
     strict: bool(o, 'strict', true),
-    maxDepth: count(o, 'maxDepth', DEFAULT_MAX_DEPTH),
+    maxDepth: depth(o),
     maxDecompressedSize: count(o, 'maxDecompressedSize', DEFAULT_MAX_DECOMPRESSED_SIZE),
+    maxValues: count(o, 'maxValues', DEFAULT_MAX_VALUES),
     autoDecompress: bool(o, 'autoDecompress', true),
     hmacKey: hmacKey(o),
     timestampObjects: oneOf(o, 'timestamps', ['date', 'object'] as const, 'date') === 'object',

@@ -99,7 +99,10 @@ interface Envelope {
   size: number;
 }
 
-/** Checks the header of a compression envelope (before any decompression), or returns null. */
+/**
+ * Checks the header of a compression envelope in SPEC §6's order (before any decompression),
+ * or returns null if the input is not one.
+ */
 function compressionEnvelope(b: Uint8Array, cfg: DecodeConfig): Envelope | null {
   if (b.length < COMPRESSION_HEADER_SIZE || !hasMagic(b, COMPRESSED_MAGIC)) return null;
   if (!cfg.autoDecompress) throw fail('invalid_envelope', 'input is compressed but autoDecompress is disabled');
@@ -115,7 +118,13 @@ function compressionEnvelope(b: Uint8Array, cfg: DecodeConfig): Envelope | null 
   }
   const alg = ALGORITHM_NAMES[b[5]!];
   if (alg === undefined) throw fail('unsupported_compression', `unknown compression algorithm id ${b[5]!}`);
-  return { alg, payload: b.subarray(COMPRESSION_HEADER_SIZE), size };
+  const payload = b.subarray(COMPRESSION_HEADER_SIZE);
+  // SPEC §6: a zlib stream must not use a preset dictionary. Checked here, ahead of every
+  // decompressor (the pure-JS inflate, node:zlib, or a caller's codec), so they all agree.
+  if (alg === 'zlib' && payload.length >= 2 && (payload[1]! & 0x20) !== 0) {
+    throw fail('invalid_envelope', 'zlib payload uses a preset dictionary (FDICT), which BTOON does not allow');
+  }
+  return { alg, payload, size };
 }
 
 function checkSize(out: Uint8Array, size: number, alg: string): Uint8Array {

@@ -162,8 +162,7 @@ test('tabular type codes describe the first row (SPEC §5.6.1)', () => {
     [new DataView(new ArrayBuffer(1)), 6], [[1], 7], [{ a: 1 }, 8], [new Map([['a', 1]]), 8], [new Date(0), 9],
     [new lib.Timestamp(0n, 0), 9], [new lib.Ext(1, new Uint8Array(1)), 9], [new Float32Array(1), 9], [new Str(), 5],
     [Array.from({ length: 10 }, (_, i) => ({ n: i })), 7], // a cell that is itself tabular
-    [new lib.Ext(-10, lib.encode(Array.from({ length: 10 }, (_, i) => ({ n: i }))).subarray(3)), 7], // raw tabular Ext
-    [new lib.Ext(-4, Uint8Array.of(1, 0, 0, 0, 0, 0, 0, 0, 0)), 9],
+    [new lib.Ext(-11, Uint8Array.of(1)), 9], // an id reserved for future versions
     [Object(5), 2], [new (class { constructor() { this.a = 1; } })(), 8],
   ];
   for (const [value, code] of cases) {

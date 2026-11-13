@@ -5,14 +5,14 @@ import {
   EXT_F32_VECTOR,
   EXT_F64_VECTOR,
   EXT_TABULAR,
+  EXT_TIMESTAMP,
   MAX_OFFSET_MINUTES,
   NANOS_PER_SECOND,
   TABULAR_VERSION,
 } from './constants.js';
-import { validateBtoonExt } from './decode.js';
 import { fail, isStackOverflow } from './errors.js';
 import { compareUtf8, isWellFormed, loneSurrogateError, textEncoder, utf8Length } from './utf8.js';
-import { dateTime, isExt, isTimestamp, type Ext, type Timestamp } from './values.js';
+import { dateTime, isExt, isTimestamp, isUint8Array, type Ext, type Timestamp } from './values.js';
 
 const TWO_32 = 4294967296;
 const TWO_34 = 17179869184;
@@ -74,6 +74,17 @@ function classify(o: object): number {
   return K_OBJECT; // class instances, and plain objects from another realm
 }
 
+/** What to encode instead of a raw `Ext` with a BTOON-defined id, indexed by -id. */
+const TYPED_INSTEAD: Record<number, string> = {
+  1: 'encode a Date or Timestamp',
+  2: 'JavaScript has no date type, so encode a Date or Timestamp (a timestamp) instead',
+  3: 'JavaScript has no datetime type, so encode a Date or Timestamp (a timestamp) instead',
+  4: 'encode a bigint',
+  5: 'encode a Float32Array',
+  6: 'encode a Float64Array',
+  10: 'encode an array of objects, which uses the tabular encoding where it is smaller',
+};
+
 function maxDepthError(): Error {
   return fail('max_depth', 'maximum nesting depth exceeded (or the value is cyclic)');
 }
@@ -131,9 +142,8 @@ function typeCode(v: unknown): number {
           return 8;
         case K_BOXED:
           return typeCode(unbox(v));
-        case K_EXT:
-          // A raw tabular extension is logically an array (its encoding starts like one).
-          return (v as Ext).type === EXT_TABULAR ? 7 : 9;
+        case K_EXT: // never a BTOON-defined id such as tabular: the encoder rejects those
+          return 9;
         case K_BUFFER:
           return 6;
         case K_VIEW: {
@@ -281,7 +291,7 @@ class Encoder {
         this.timestamp(o as Timestamp);
         return;
       case K_EXT:
-        this.ext(o as Ext, depth);
+        this.ext(o as Ext);
         return;
       case K_TOJSON:
         // Like JSON.stringify, toJSON() is called once per value: a result that has its own
@@ -579,14 +589,24 @@ class Encoder {
     }
   }
 
-  private ext(e: Ext, depth: number): void {
+  /**
+   * A raw extension, written as given. SPEC §5.7: the ids BTOON defines (-1…-6 and -10) are
+   * rejected, because a verbatim payload could be malformed or non-canonical; those types are
+   * written from their typed values. Ids reserved for future versions (-7…-9, -11…-128) and
+   * application ids (0…127) pass through. The fields are checked here, not only in the `Ext`
+   * constructor, because they can be reassigned and an `Ext` may come from another copy of
+   * the library.
+   */
+  private ext(e: Ext): void {
     const type = e.type;
     const data = e.data;
     if (typeof type !== 'number' || !Number.isInteger(type) || type < -128 || type > 127) {
       throw fail('invalid_argument', 'Ext type must be an integer in [-128, 127]');
     }
-    if (!ArrayBuffer.isView(data)) throw fail('invalid_argument', 'Ext data must be a Uint8Array');
-    validateBtoonExt(type, data, depth, this.maxDepth);
+    if ((type <= EXT_TIMESTAMP && type >= EXT_F64_VECTOR) || type === EXT_TABULAR) {
+      throw fail('invalid_argument', `Ext type ${type} is defined by BTOON and can't be written raw (SPEC §5.7); ${TYPED_INSTEAD[-type]}`);
+    }
+    if (!isUint8Array(data)) throw fail('invalid_argument', 'Ext data must be a Uint8Array');
     this.extHeader(type, data.byteLength);
     this.bytes(data);
   }

@@ -19,8 +19,8 @@ import {
   type EncodeOptions,
 } from '@btoon/js';
 
-const version: '0.1.2' = VERSION;
-const spec: '0.1' = SPEC_VERSION;
+const version: '0.2.0' = VERSION;
+const spec: '0.2' = SPEC_VERSION;
 
 const bytes: Uint8Array<ArrayBuffer> = encode({ a: 1, b: [true, null], when: new Date() });
 // The result is a plain ArrayBuffer-backed view, usable wherever a BufferSource is expected.
@@ -48,10 +48,15 @@ const encodeOptions: EncodeOptions = {
 };
 const decodeOptions: DecodeOptions = {
   maxDecompressedSize: 1 << 20,
+  maxValues: 1 << 24,
   autoDecompress: true,
   hmacKey: new Uint8Array(32),
   codecs,
 };
+// @ts-expect-error: "no key" is an absent option, not null
+const nullKey: DecodeOptions = { hmacKey: null };
+// @ts-expect-error: maxValues is a number
+const badLimit: DecodeOptions = { maxValues: '10' };
 // @ts-expect-error: not a supported algorithm
 const badAlgorithm: EncodeOptions = { compression: 'gzip' };
 // @ts-expect-error: not a timestamps mode
@@ -89,6 +94,7 @@ const extData: Uint8Array = ext.data;
 
 export {
   badAlgorithm,
+  badLimit,
   badMode,
   blob,
   body,
@@ -98,6 +104,7 @@ export {
   extType,
   fromDate,
   nanos,
+  nullKey,
   offset,
   roundTrip,
   seconds,
