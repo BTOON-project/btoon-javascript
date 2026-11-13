@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 (2026-11-13): BTOON spec 0.2
+## 0.2.0 (2026-11-14): BTOON spec 0.2
 
 Implements [spec 0.2](https://github.com/BTOON-project/btoon-core/blob/main/docs/SPEC.md)
 (decisions D23–D26). The wire format is unchanged, and every valid 0.1 document that fits
