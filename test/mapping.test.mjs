@@ -22,7 +22,7 @@ for (const name of ['esm/node', 'esm/portable']) {
   describe(`${name}: constants and errors`, () => {
     test('VERSION and SPEC_VERSION', () => {
       assert.equal(lib.VERSION, pkg.version);
-      assert.equal(lib.SPEC_VERSION, '0.1');
+      assert.equal(lib.SPEC_VERSION, '0.2');
     });
     test('BtoonError shape', () => {
       try {
@@ -387,13 +387,20 @@ for (const name of ['esm/node', 'esm/portable']) {
       const table = Array.from({ length: 10 }, (_, i) => ({ i }));
       assert.equal(encode(table, { maxDepth: 2 })[0], 0xc7);
       throwsCode(() => encode(table, { maxDepth: 1 }), 'max_depth');
-      // Very deep input with a huge maxDepth reports max_depth, not a RangeError.
+      // maxDepth is at most 1000 (SPEC §7), and that much nesting fits the call stack.
       let huge = null;
       for (let i = 0; i < 200000; i++) huge = [huge];
-      throwsCode(() => encode(huge, { maxDepth: 1e9 }), 'max_depth');
+      throwsCode(() => encode(huge, { maxDepth: 1000 }), 'max_depth');
+      throwsCode(() => encode(huge, { maxDepth: 1001 }), 'invalid_argument');
       const deepBytes = new Uint8Array(200001).fill(0x91);
       deepBytes[200000] = 0xc0;
-      throwsCode(() => decode(deepBytes, { maxDepth: 1e9 }), 'max_depth');
+      throwsCode(() => decode(deepBytes, { maxDepth: 1000 }), 'max_depth');
+      throwsCode(() => decode(deepBytes, { maxDepth: 1001 }), 'invalid_argument');
+      let thousand = null;
+      for (let i = 0; i < 1000; i++) thousand = [thousand];
+      assert.equal(encode(thousand, { maxDepth: 1000 }).length, 1001);
+      assert.equal(decode(deepBytes.subarray(199000), { maxDepth: 1000 }).length, 1);
+      throwsCode(() => decode(deepBytes.subarray(198999), { maxDepth: 1000 }), 'max_depth');
     });
     test('values from another realm', () => {
       const ctx = vm.createContext({});
@@ -493,23 +500,41 @@ for (const name of ['esm/node', 'esm/portable']) {
       throwsCode(() => new Ext(1, [1, 2]), 'invalid_argument');
       throwsCode(() => new Ext(1, new Uint16Array(1)), 'invalid_argument');
     });
-    test('Ext with a BTOON-defined id must carry a valid payload', () => {
-      const be64 = (v) => {
-        const b = new Uint8Array(8);
-        new DataView(b.buffer).setBigInt64(0, v);
-        return b;
-      };
-      assert.equal(enc(new Ext(-2, be64(1700000000123n))), 'd7fe0000018bcfe5687b');
-      assert.equal(enc(new Ext(-3, be64(-1n))), 'd7fdffffffffffffffff');
-      throwsCode(() => encode(new Ext(-2, new Uint8Array(4))), 'invalid_argument');
-      throwsCode(() => encode(new Ext(-1, new Uint8Array(3))), 'invalid_argument');
-      throwsCode(() => encode(new Ext(-4, new Uint8Array(0))), 'invalid_argument');
-      throwsCode(() => encode(new Ext(-5, new Uint8Array(3))), 'invalid_argument');
-      throwsCode(() => encode(new Ext(-10, new Uint8Array(12))), 'invalid_argument');
+    test('an Ext with an id BTOON defines is never written (SPEC §5.7)', () => {
+      // Even valid, canonical payloads: those types are written from their typed values.
       const tabular = encode(Array.from({ length: 10 }, (_, i) => ({ ab: i })));
-      const payload = tabular.subarray(3);
-      assert.equal(hex(encode(new Ext(-10, payload))), hex(tabular));
-      assert.equal(enc(new Ext(-1, unhex('0000000065920080'))), 'd7ff0000000065920080', 'valid but non-canonical: verbatim');
+      const valid = {
+        [-1]: unhex('65920080'), [-2]: unhex('0000018bcfe5687b'), [-3]: unhex('ffffffffffffffff'),
+        [-4]: unhex('010000000000000000'), [-5]: unhex('0000803f'), [-6]: unhex('000000000000f03f'),
+        [-10]: tabular.subarray(3),
+      };
+      for (const [type, data] of Object.entries(valid).map(([t, d]) => [Number(t), d])) {
+        const e = new Ext(type, data); // the constructor accepts it; the encoder refuses it
+        throwsCode(() => encode(e), 'invalid_argument');
+        throwsCode(() => encode([1, { k: e }]), 'invalid_argument');
+        throwsCode(() => encode(Array.from({ length: 10 }, () => ({ k: e }))), 'invalid_argument');
+        throwsCode(() => encode(new Ext(type, new Uint8Array(3))), 'invalid_argument');
+        assert.throws(() => encode(e), (err) => err.code === 'invalid_argument' && err.message.includes(`Ext type ${type} `));
+      }
+      // The typed values write these types.
+      assert.equal(enc(new Date(Date.UTC(2024, 0, 1))), 'd6ff65920080');
+      assert.equal(enc(2n ** 64n), 'c709fc010000000000000000');
+      assert.equal(enc(new Float32Array([1])), 'd6fb0000803f');
+      // Ids reserved for future versions are written as given, like application ids.
+      for (const type of [-7, -8, -9, -11, -12, -100, -127, -128]) {
+        const back = dec(enc(new Ext(type, Uint8Array.of(1, 2))));
+        assert.ok(back instanceof Ext);
+        assert.equal(back.type, type);
+        assert.deepEqual([...back.data], [1, 2]);
+      }
+      assert.equal(enc(new Ext(-11, Uint8Array.of(1))), 'd4f501');
+      // Fields reassigned after construction are checked again.
+      const changed = new Ext(5, Uint8Array.of(1));
+      Object.defineProperty(changed, 'type', { value: -4 });
+      throwsCode(() => encode(changed), 'invalid_argument');
+      const data16 = new Ext(5, Uint8Array.of(1, 2));
+      Object.defineProperty(data16, 'data', { value: new Uint16Array([0x0102]) });
+      throwsCode(() => encode(data16), 'invalid_argument');
     });
   });
 
@@ -532,6 +557,15 @@ for (const name of ['esm/node', 'esm/portable']) {
     test('option validation', () => {
       throwsCode(() => encode(1, { maxDepth: -1 }), 'invalid_argument');
       throwsCode(() => encode(1, { maxDepth: 1.5 }), 'invalid_argument');
+      throwsCode(() => encode(1, { maxDepth: 1001 }), 'invalid_argument');
+      throwsCode(() => dec('c0', { maxDepth: 1001 }), 'invalid_argument');
+      throwsCode(() => dec('c0', { maxDepth: Infinity }), 'invalid_argument');
+      throwsCode(() => encode(1, { hmacKey: null }), 'invalid_argument');
+      throwsCode(() => dec('c0', { hmacKey: null }), 'invalid_argument');
+      for (const bad of [-1, 1.5, '10', Infinity, NaN, null, 2 ** 53]) {
+        throwsCode(() => dec('c0', { maxValues: bad }), 'invalid_argument');
+      }
+      assert.equal(dec('c0', { maxValues: Number.MAX_SAFE_INTEGER }), null);
       throwsCode(() => encode(1, { compression: 'gzip' }), 'invalid_argument');
       throwsCode(() => encode(1, { autoTabular: 'yes' }), 'invalid_argument');
       throwsCode(() => encode(1, { hmacKey: '' }), 'invalid_argument');
@@ -548,11 +582,17 @@ for (const name of ['esm/node', 'esm/portable']) {
       assert.equal(dec('c0', null), null);
       assert.equal(enc(1, null), '01');
     });
-    test('non-strict mode relaxes trailing data, duplicates and UTF-8 only', () => {
+    test('non-strict mode relaxes trailing data, duplicates and the UTF-8 of string values only', () => {
       assert.equal(dec('0102', { strict: false }), 1);
       throwsCode(() => dec('0102'), 'trailing_data');
-      assert.equal(dec('a1ff', { strict: false }), '�');
+      assert.equal(dec('a1ff', { strict: false }), '\uFFFD');
+      assert.deepEqual(dec('81a16192a1ffa3e08080', { strict: false }), { a: ['\uFFFD', '\uFFFD\uFFFD\uFFFD'] });
       throwsCode(() => dec('a1ff'), 'invalid_utf8');
+      // Map keys and column names must be valid UTF-8 in both modes (SPEC §7).
+      throwsCode(() => dec('81a1ff01', { strict: false }), 'invalid_utf8');
+      throwsCode(() => dec('82a1ff01a1fe02', { strict: false }), 'invalid_utf8');
+      throwsCode(() => dec('81d920' + 'ff'.repeat(32) + '01', { strict: false }), 'invalid_utf8');
+      throwsCode(() => dec('c717f600000001000000010000000100000001ff0000000001c0', { strict: false }), 'invalid_utf8');
       throwsCode(() => dec('9201', { strict: false }), 'truncated');
       throwsCode(() => dec('9191c0', { strict: false, maxDepth: 1 }), 'max_depth');
       throwsCode(() => dec('ddffffffff', { strict: false }), 'truncated');

@@ -23,13 +23,20 @@ export type BtoonErrorCode =
   | 'invalid_tabular'
   /** A malformed compression or signed envelope, or a corrupt compressed payload. */
   | 'invalid_envelope'
-  /** A size above a configured limit (for example `maxDecompressedSize`). */
+  /**
+   * A size above a configured limit: an envelope's declared size, or a table's copied column
+   * names, above `maxDecompressedSize`; more values than `maxValues`; or a value too large
+   * for the JavaScript engine.
+   */
   | 'size_limit'
   /** A compression algorithm that is unknown or not available in this environment. */
   | 'unsupported_compression'
   /** HMAC verification failed, a signature was required but missing, or a signed input arrived without a key. */
   | 'authentication_failed'
-  /** A value that cannot be encoded, or an invalid option. */
+  /**
+   * A value that cannot be encoded (including an `Ext` with an id BTOON defines), or an
+   * invalid option (including an empty or `null` `hmacKey`, or `maxDepth` above 1000).
+   */
   | 'invalid_argument';
 
 /**
@@ -62,14 +69,19 @@ export function fail(code: BtoonErrorCode, message: string, cause?: unknown): Bt
 }
 
 /**
- * True for the engine's "too much recursion" error. Raising `maxDepth` far above the
- * default can exhaust the JavaScript call stack before the depth limit triggers; that
- * case is reported as `max_depth` instead of leaking a RangeError.
+ * True for the engine's "too much recursion" error. `maxDepth` is at most 1000, which fits
+ * the default stack, but a call that starts with little stack left (deep recursion in the
+ * caller, a worker with a small stack) can still run out before the depth limit triggers;
+ * that case is reported as `max_depth` instead of leaking a RangeError.
  */
 export function isStackOverflow(e: unknown): boolean {
   if (e instanceof BtoonError) return false;
   if (typeof e !== 'object' || e === null) return false;
   const err = e as { name?: unknown; message?: unknown };
   if (err.name !== 'RangeError' && err.name !== 'InternalError') return false;
-  return typeof err.message === 'string' && /call stack|recursion/i.test(err.message);
+  if (typeof err.message !== 'string') return false;
+  // No regular expression: this runs when the stack ran out, and V8 compiles a regular
+  // expression on first use, which then fails with a SyntaxError ("Stack overflow").
+  const message = err.message.toLowerCase();
+  return message.includes('call stack') || message.includes('recursion');
 }

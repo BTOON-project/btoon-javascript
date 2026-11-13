@@ -3,7 +3,9 @@
 // document of 64 nested tabulars built 4 GB of empty rows and ended in a fatal, uncatchable
 // "JavaScript heap out of memory". These documents are decoded in a worker whose heap is
 // capped at 64 MB: a regression shows up as ERR_WORKER_OUT_OF_MEMORY instead of the error
-// code the document deserves.
+// code the document deserves. Since spec 0.2 the default maxValues stops the nested tables
+// early (their rows count at each header), so they are also decoded with maxValues lifted,
+// which leaves only the pre-allocation bound in the way.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { Worker } from 'node:worker_threads';
@@ -41,12 +43,12 @@ function nestedTabulars(innermost) {
   return doc;
 }
 
-function decodeInWorker(entry, doc, maxDepth) {
+function decodeInWorker(entry, doc, options) {
   const code = `
     const { parentPort, workerData } = require('node:worker_threads');
     import(workerData.entry).then((lib) => {
       try {
-        lib.decode(workerData.doc, { maxDepth: workerData.maxDepth });
+        lib.decode(workerData.doc, workerData.options);
         parentPort.postMessage('ok');
       } catch (e) {
         parentPort.postMessage(e.code ?? String(e));
@@ -55,7 +57,7 @@ function decodeInWorker(entry, doc, maxDepth) {
   return new Promise((resolve) => {
     const worker = new Worker(code, {
       eval: true,
-      workerData: { entry, doc, maxDepth },
+      workerData: { entry, doc, options },
       resourceLimits: { maxOldGenerationSizeMb: 64, maxYoungGenerationSizeMb: 16 },
     });
     worker.once('message', resolve);
@@ -63,16 +65,19 @@ function decodeInWorker(entry, doc, maxDepth) {
   });
 }
 
+// [name, document, verdict with the default options, verdict with maxValues lifted]
 const cases = [
-  ['127 nested array32 headers', nestedArrays(127), 'truncated'],
-  ['64 nested tabulars around a binary', nestedTabulars(tabular(Uint8Array.from([0xc6, ...be32(PAYLOAD), ...new Uint8Array(PAYLOAD)]), 1)), 'invalid_tabular'],
-  ['64 nested tabulars around nil rows', nestedTabulars(tabular(new Uint8Array(PAYLOAD / 4).fill(0xc0), PAYLOAD / 4)), 'invalid_tabular'],
+  ['127 nested array32 headers', nestedArrays(127), 'truncated', 'truncated'],
+  ['64 nested tabulars around a binary', nestedTabulars(tabular(Uint8Array.from([0xc6, ...be32(PAYLOAD), ...new Uint8Array(PAYLOAD)]), 1)), 'size_limit', 'invalid_tabular'],
+  ['64 nested tabulars around nil rows', nestedTabulars(tabular(new Uint8Array(PAYLOAD / 4).fill(0xc0), PAYLOAD / 4)), 'size_limit', 'invalid_tabular'],
 ];
 
-for (const [name, doc, expected] of cases) {
+for (const [name, doc, byDefault, lifted] of cases) {
   test(`${name}: decoded within a 64 MB heap`, async () => {
     for (const [build, entry] of Object.entries(ENTRIES)) {
-      assert.equal(await decodeInWorker(entry, doc, 128), expected, `${build} build, ${doc.length}-byte input`);
+      const what = `${build} build, ${doc.length}-byte input`;
+      assert.equal(await decodeInWorker(entry, doc, {}), byDefault, `${what}, default options`);
+      assert.equal(await decodeInWorker(entry, doc, { maxValues: 2 ** 40 }), lifted, `${what}, maxValues 2^40`);
     }
   });
 }

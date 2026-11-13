@@ -1,18 +1,20 @@
 // Conformance (SPEC §10, IMPLEMENTATION-GUIDE §1): every non-error vector decodes to its
 // value, every canonical vector re-encodes byte-for-byte, every error vector is rejected
-// with its code. Runs against each build, synchronously and asynchronously.
+// with its code, and every encode_error vector's value is refused by the encoder with its
+// code. Each vector's options apply. Runs against each build, synchronously and
+// asynchronously.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import zlib from 'node:zlib';
-import { builds, fromTyped, hex, jsRepresentable, loadVectors, mismatch, unhex, vectorOptions } from './helpers.mjs';
+import { builds, fromTyped, hex, loadVectors, mismatch, reencodable, unhex, vectorOptions } from './helpers.mjs';
 
 const doc = loadVectors();
 
 test('vector file matches the implemented spec and defaults', () => {
   const lib = builds['esm/node'];
   assert.equal(doc.spec, lib.SPEC_VERSION);
-  assert.deepEqual(doc.defaults, { max_depth: 128, max_decompressed_size: 268435456, strict: true });
-  assert.ok(doc.vectors.length >= 200);
+  assert.deepEqual(doc.defaults, { max_depth: 128, max_decompressed_size: 64 * 1024 * 1024, max_values: 2 ** 20, strict: true });
+  assert.ok(doc.vectors.length >= 298);
 });
 
 // Codecs backed by node:zlib, to run the optional-codec vectors through `options.codecs`
@@ -23,6 +25,21 @@ const testCodecs = {
     ? { zstd: { decompress: (d, n) => zlib.zstdDecompressSync(d, { maxOutputLength: Math.max(1, n) }) } }
     : {}),
 };
+
+// SPEC §10: a canonical vector whose value the implementation has no native type for MAY
+// skip the re-encoding, but MUST still decode. In JavaScript these are exactly the vectors
+// with the float 0.0 (the integer 0 in JavaScript) or a date or datetime (no such types;
+// the last vector has date and datetime cells). See `reencodable` in helpers.mjs. They are
+// decoded and checked like every other vector; the list is exact, so nothing else skips.
+const NOT_REENCODABLE = [
+  'float/0',
+  'date/epoch',
+  'date/2023',
+  'date/negative',
+  'datetime/2023',
+  'datetime/negative',
+  'tabular/type-code-9-variants',
+];
 
 const modes = [];
 for (const [name, lib] of Object.entries(builds)) {
@@ -43,9 +60,26 @@ for (const { name, lib, sync, codecs } of modes) {
     const notReencoded = [];
     let passed = 0;
     let reencoded = 0;
+    let refused = 0;
     for (const v of doc.vectors) {
-      const bytes = unhex(v.hex);
       const { dec, enc } = vectorOptions(v);
+      if (v.encode_error !== undefined) {
+        // The value must be refused by the encoder (building it must succeed).
+        const value = fromTyped(v.value, lib);
+        try {
+          const out = await encode(value, enc);
+          failures.push(`${v.id}: expected encode error ${v.encode_error}, encoded ${hex(out)}`);
+        } catch (e) {
+          if (!(e instanceof lib.BtoonError)) failures.push(`${v.id}: encode threw a non-BtoonError: ${e}`);
+          else if (e.code !== v.encode_error) failures.push(`${v.id}: expected encode error ${v.encode_error}, got ${e.code} (${e.message})`);
+          else {
+            passed++;
+            refused++;
+          }
+        }
+        continue;
+      }
+      const bytes = unhex(v.hex);
       if (codecs) dec.codecs = codecs;
       if (v.error !== undefined) {
         try {
@@ -81,7 +115,7 @@ for (const { name, lib, sync, codecs } of modes) {
       }
       if (!ok) continue;
       if (v.canonical) {
-        if (!jsRepresentable(v.value)) {
+        if (!reencodable(v.value)) {
           notReencoded.push(v.id);
         } else {
           const out = hex(await encode(fromTyped(v.value, lib), enc));
@@ -96,12 +130,13 @@ for (const { name, lib, sync, codecs } of modes) {
     }
     const line =
       `${label}: ${passed}/${doc.vectors.length} passed, ${reencoded} canonical re-encodings byte-exact, ` +
-      `skipped: [${skipped.join(', ')}], not re-encodable in JS: [${notReencoded.join(', ')}]`;
+      `${refused} encode errors, skipped: [${skipped.join(', ')}], not re-encodable in JS: [${notReencoded.join(', ')}]`;
     summary.push(line);
     t.diagnostic(line);
     assert.deepEqual(failures, []);
     // Only codecs that are genuinely missing may be skipped.
     for (const s of skipped) assert.match(s, /requires (lz4|zstd|brotli|snappy)/);
-    assert.deepEqual(notReencoded, ['float/0'], 'only 0.0 is indistinguishable from the integer 0 in JS');
+    assert.deepEqual(notReencoded, NOT_REENCODABLE);
+    assert.equal(refused, doc.vectors.filter((v) => v.encode_error !== undefined).length);
   });
 }

@@ -115,8 +115,7 @@ function typeCode(v) {
   if (ArrayBuffer.isView(v) || v instanceof ArrayBuffer) return 6;
   if (Array.isArray(v)) return 7;
   if (isMapLike(v)) return 8;
-  if (v.constructor?.name === 'Ext' && v.type === -10) return 7;
-  return 9;
+  return 9; // includes every Ext: the ids BTOON defines can't be written raw (§5.7)
 }
 
 export function refEncode(v, opts = {}) {
@@ -153,7 +152,10 @@ export function refEncode(v, opts = {}) {
     return timestamp(s, Number(r) * 1e6);
   }
   if (v.constructor?.name === 'Timestamp') return timestamp(v.seconds, v.nanoseconds, v.offsetMinutes);
-  if (v.constructor?.name === 'Ext') return ext(v.type, v.data);
+  if (v.constructor?.name === 'Ext') {
+    if ((v.type <= -1 && v.type >= -6) || v.type === -10) throw new Error(`reference encoder: Ext(${v.type}) is not writable (§5.7)`);
+    return ext(v.type, v.data);
+  }
   if (Array.isArray(v)) {
     if (tabular && v.length >= 2 && v.every(isMapLike)) {
       const keys = sortKeys(entriesOf(v[0]).map(([k]) => k));

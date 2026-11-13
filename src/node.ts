@@ -24,19 +24,21 @@ export { Ext, Timestamp } from './values.js';
  * `bigint`, strings (must not contain lone surrogates), `Uint8Array`/`ArrayBuffer`/other
  * typed arrays and `DataView` (binary), `Float32Array`/`Float64Array` (float vectors),
  * arrays, plain objects and `Map`s with string keys (maps, keys sorted by UTF-8 bytes),
- * `Date` and {@link Timestamp} (timestamps), and {@link Ext}. Any other object is encoded
- * the way `JSON.stringify` sees it: the result of its `toJSON()` method if it has one
- * (called once), otherwise a map of its own enumerable string-keyed properties; `Number`,
- * `String`, `Boolean` and `BigInt` wrapper objects are unwrapped. Functions and symbols are
- * rejected. Arrays of uniform objects use the tabular encoding when it is smaller.
+ * `Date` and {@link Timestamp} (timestamps), and {@link Ext} (except for the ids BTOON
+ * defines, SPEC §5.7). Any other object is encoded the way `JSON.stringify` sees it: the
+ * result of its `toJSON()` method if it has one (called once), otherwise a map of its own
+ * enumerable string-keyed properties; `Number`, `String`, `Boolean` and `BigInt` wrapper
+ * objects are unwrapped. Functions and symbols are rejected. Arrays of uniform objects use
+ * the tabular encoding when it is smaller.
  *
  * With `compress` or `hmacKey`, the document is wrapped in a compression and/or signed
  * envelope, layered as sign(compress(document)).
  *
- * @throws {BtoonError} `invalid_argument` for functions, symbols or invalid options, `max_depth`
- *   for values nested deeper than `maxDepth` (including cycles), `invalid_utf8` for strings
- *   with lone surrogates, `unsupported_compression` if the algorithm has no synchronous
- *   implementation here (see `encodeAsync` and `options.codecs`).
+ * @throws {BtoonError} `invalid_argument` for functions, symbols, an `Ext` with an id BTOON
+ *   defines, or invalid options; `max_depth` for values nested deeper than `maxDepth`
+ *   (including cycles); `invalid_utf8` for strings with lone surrogates;
+ *   `unsupported_compression` if the algorithm has no synchronous implementation here (see
+ *   `encodeAsync` and `options.codecs`).
  */
 export function encode(value: unknown, options?: EncodeOptions): Uint8Array<ArrayBuffer> {
   return encodeWith(value, options, nodePlatform);
@@ -44,10 +46,10 @@ export function encode(value: unknown, options?: EncodeOptions): Uint8Array<Arra
 
 /**
  * Decodes one BTOON document, enforcing SPEC §7: bounds-checked reads, a nesting limit,
- * no allocation beyond what the input justifies, strict UTF-8, unique map keys and no
- * trailing bytes. Compression envelopes are decompressed (with the output capped at the
- * declared size and `maxDecompressedSize`); with `hmacKey` the signature is verified before
- * anything is parsed.
+ * no allocation beyond what the input justifies, a limit on the number of decoded values
+ * (`maxValues`), strict UTF-8, unique map keys and no trailing bytes. Compression envelopes
+ * are decompressed (with the output capped at the declared size and `maxDecompressedSize`);
+ * with `hmacKey` the signature is verified before anything is parsed.
  *
  * Maps decode to plain objects. A `"__proto__"` key becomes an own property (as with
  * `JSON.parse`); it never changes an object's prototype.

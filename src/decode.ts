@@ -2,9 +2,10 @@
 //  * every read is bounds-checked against `end` (no reads past the input);
 //  * containers are depth-limited (max_depth) — no unbounded recursion;
 //  * nothing is allocated beyond what the remaining input could encode, and what containers
-//    allocate before their elements are decoded is bounded for the whole document.
+//    allocate before their elements are decoded is bounded for the whole document;
+//  * the document decodes to at most max_values values, and a table's rows copy at most
+//    max_decompressed_size bytes of column names (SPEC §7.1).
 import {
-  DEFAULT_MAX_DEPTH,
   EXT_BIGINT,
   EXT_DATE,
   EXT_DATETIME,
@@ -79,23 +80,35 @@ class Decoder {
   end: number;
   readonly strict: boolean;
   readonly maxDepth: number;
+  readonly maxDecompressedSize: number;
+  readonly maxValues: number;
   readonly tsObjects: boolean;
   readonly bigAlways: boolean;
+  /** How many more values the document may decode to (SPEC §7.1); negative once exceeded. */
+  private valuesLeft: number;
   /** Slots reserved by the arrays and row lists being decoded (see reserve). */
   private reserved = 0;
 
-  constructor(bytes: Uint8Array, strict: boolean, maxDepth: number, tsObjects: boolean, bigAlways: boolean) {
+  constructor(bytes: Uint8Array, cfg: DecodeConfig) {
     this.bytes = plainBytes(bytes);
     this.view = new DataView(this.bytes.buffer, this.bytes.byteOffset, this.bytes.byteLength);
     this.end = this.bytes.length;
-    this.strict = strict;
-    this.maxDepth = maxDepth;
-    this.tsObjects = tsObjects;
-    this.bigAlways = bigAlways;
+    this.strict = cfg.strict;
+    this.maxDepth = cfg.maxDepth;
+    this.maxDecompressedSize = cfg.maxDecompressedSize;
+    this.maxValues = cfg.maxValues;
+    this.valuesLeft = cfg.maxValues;
+    this.tsObjects = cfg.timestampObjects;
+    this.bigAlways = cfg.bigintAlways;
   }
 
   err(code: BtoonErrorCode, message: string, at: number = this.pos): BtoonError {
     return fail(code, `${message} (at byte ${at})`);
+  }
+
+  /** SPEC §7.1: the document decodes to more values than `maxValues` allows. */
+  private tooManyValues(at: number = this.pos): BtoonError {
+    return this.err('size_limit', `document decodes to more than maxValues (${this.maxValues}) values`, at);
   }
 
   private need(n: number): void {
@@ -122,6 +135,8 @@ class Decoder {
   }
 
   value(depth: number): unknown {
+    // SPEC §7.1: a value counts when it starts, before its marker or anything inside it.
+    if (--this.valuesLeft < 0) throw this.tooManyValues();
     if (this.pos >= this.end) throw this.err('truncated', 'unexpected end of input');
     const m = this.bytes[this.pos++]!;
     if (m < 0x80) return m;
@@ -233,10 +248,23 @@ class Decoder {
     return this.view.getBigInt64(p);
   }
 
+  /** A string value. Non-strict mode replaces invalid UTF-8 with U+FFFD (SPEC §7). */
   private str(len: number): string {
     if (len > this.end - this.pos) throw this.err('truncated', 'string runs past the end of input');
     const s = decodeUtf8(this.bytes, this.pos, len, this.strict);
     if (s === undefined) throw this.err('invalid_utf8', 'string is not valid UTF-8');
+    this.pos += len;
+    return s;
+  }
+
+  /**
+   * A map key's text. Keys must be valid UTF-8 in non-strict mode too (SPEC §7): they are
+   * compared by their bytes, and replacing invalid sequences could merge two distinct keys.
+   */
+  private keyText(len: number): string {
+    if (len > this.end - this.pos) throw this.err('truncated', 'string runs past the end of input');
+    const s = decodeUtf8(this.bytes, this.pos, len, true);
+    if (s === undefined) throw this.err('invalid_utf8', 'map key is not valid UTF-8');
     this.pos += len;
     return s;
   }
@@ -315,7 +343,7 @@ class Decoder {
         return s;
       }
     }
-    return this.str(len);
+    return this.keyText(len);
   }
 
   private map(n: number, depth: number): Record<string, unknown> {
@@ -354,7 +382,7 @@ class Decoder {
   }
 
   /** Interprets the payload `bytes[start, start+len)` of an extension of `type`. */
-  extValue(type: number, start: number, len: number, depth: number): unknown {
+  private extValue(type: number, start: number, len: number, depth: number): unknown {
     const view = this.view;
     const bad = (what: string): BtoonError => this.err('invalid_extension', what, start);
     switch (type) {
@@ -471,22 +499,36 @@ class Decoder {
     if (cols === 0 && rowCount > 0) throw bad('tabular rows without columns');
     // Each column needs at least 9 bytes: name length, type code, column length.
     if (cols > (end - p) / 9) throw bad('tabular column count exceeds the payload');
+    // SPEC §5.6.3: names are checked front to back, each first for UTF-8 (in non-strict mode
+    // too, since names are compared by their bytes) and then against the earlier names. The
+    // first name that fails sets the error.
     const names: string[] = [];
+    const seen = new Set<string>();
+    let nameBytes = 0;
     for (let c = 0; c < cols; c++) {
       if (end - p < 4) throw bad('tabular payload truncated');
       const n = view.getUint32(p);
       p += 4;
       if (n > end - p) throw bad('tabular column name runs past the payload');
-      const name = decodeUtf8(this.bytes, p, n, this.strict);
+      const name = decodeUtf8(this.bytes, p, n, true);
       if (name === undefined) throw this.err('invalid_utf8', 'column name is not valid UTF-8', p);
+      if (seen.has(name)) throw bad('duplicate tabular column name');
+      seen.add(name);
       names.push(name);
+      nameBytes += n;
       p += n;
     }
-    if (new Set(names).size !== cols) throw bad('duplicate tabular column name');
     if (cols > end - p) throw bad('tabular payload truncated');
     p += cols; // type codes are informational (SPEC §5.6.1)
-    // Every cell is at least one byte.
+    // Then, in this order (SPEC §5.6.3): every cell is at least one byte; the names copied
+    // into every row stay within maxDecompressedSize; the rows count as values (§7.1). The
+    // products are below 2^64 and compare exactly with a safe integer (rounding is monotonic).
     if (rowCount * cols > end - p) throw bad('tabular row count exceeds the payload');
+    if (rowCount * nameBytes > this.maxDecompressedSize) {
+      throw this.err('size_limit', `tabular column names copied into its rows exceed maxDecompressedSize (${this.maxDecompressedSize})`, p);
+    }
+    if (rowCount > this.valuesLeft) throw this.tooManyValues(p);
+    this.valuesLeft -= rowCount;
     // Each row is created once its first cell has been decoded, so the rows are backed by
     // input actually consumed, however many the header announces.
     const reserved = this.reserve(rowCount);
@@ -533,7 +575,7 @@ class Decoder {
 
 /** Decodes one bare BTOON document (no envelopes). */
 export function decodeDocument(bytes: Uint8Array, cfg: DecodeConfig): unknown {
-  const d = new Decoder(bytes, cfg.strict, cfg.maxDepth, cfg.timestampObjects, cfg.bigintAlways);
+  const d = new Decoder(bytes, cfg);
   let v: unknown;
   try {
     v = d.value(0);
@@ -543,22 +585,4 @@ export function decodeDocument(bytes: Uint8Array, cfg: DecodeConfig): unknown {
   }
   if (d.pos !== d.end && cfg.strict) throw d.err('trailing_data', 'trailing bytes after the top-level value');
   return v;
-}
-
-/**
- * Used by the encoder: an `Ext` that carries a BTOON-defined id must hold a payload a
- * strict decoder accepts, so the encoder never emits a document decoders reject.
- */
-export function validateBtoonExt(type: number, data: Uint8Array, depth: number, maxDepth: number = DEFAULT_MAX_DEPTH): void {
-  if (!((type <= EXT_TIMESTAMP && type >= EXT_F64_VECTOR) || type === EXT_TABULAR)) return;
-  const d = new Decoder(data, true, maxDepth, true, true);
-  try {
-    d.extValue(type, 0, d.end, depth);
-  } catch (e) {
-    if (e instanceof BtoonError) {
-      throw fail('invalid_argument', `Ext(${type}) does not hold a valid payload for that BTOON type: ${e.message}`, e);
-    }
-    if (isStackOverflow(e)) throw fail('max_depth', 'Ext payload nests too deeply', e);
-    throw e;
-  }
 }

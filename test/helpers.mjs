@@ -34,7 +34,10 @@ export function loadVectors() {
   return JSON.parse(readFileSync(new URL('./vectors/btoon-vectors.json', import.meta.url), 'utf8'));
 }
 
-/** Maps a vector's snake_case "options" onto decode/encode options. Unknown keys fail loudly. */
+/**
+ * Maps a vector's snake_case "options" (SPEC §10) onto decode/encode options. Unknown keys
+ * fail loudly. `hmac_key` is hex, and an empty string is an empty key (`invalid_argument`).
+ */
 export function vectorOptions(v) {
   const dec = {};
   const enc = {};
@@ -50,6 +53,9 @@ export function vectorOptions(v) {
         break;
       case 'max_decompressed_size':
         dec.maxDecompressedSize = val;
+        break;
+      case 'max_values':
+        dec.maxValues = val;
         break;
       case 'strict':
         dec.strict = val;
@@ -74,11 +80,35 @@ function parseFloatTyped(s) {
   return Number(s);
 }
 
-function be64(v) {
-  const b = new Uint8Array(8);
-  new DataView(b.buffer).setBigInt64(0, v);
-  return b;
+/**
+ * The exact bits of a float vector element (SPEC §10): "NaN" is the canonical quiet NaN of
+ * the width, "0x…" is a bit pattern (most significant byte first), anything else a number
+ * rounded to the width (a float32 overflow becomes ±Infinity). Bits never pass through a
+ * JavaScript number, which could change a NaN's payload.
+ */
+function elementBits(s, width) {
+  if (s.startsWith('0x')) return BigInt(s);
+  if (s === 'NaN') return width === 4 ? 0x7fc00000n : 0x7ff8000000000000n;
+  const dv = new DataView(new ArrayBuffer(8));
+  if (width === 4) {
+    dv.setFloat32(0, parseFloatTyped(s));
+    return BigInt(dv.getUint32(0));
+  }
+  dv.setFloat64(0, parseFloatTyped(s));
+  return dv.getBigUint64(0);
 }
+
+/** A Float32Array or Float64Array whose elements have exactly the bits the vector gives. */
+function vectorOf(kind, elements) {
+  if (kind === 'float32_vector') {
+    const bits = Uint32Array.from(elements, (e) => Number(elementBits(e, 4)));
+    return new Float32Array(bits.buffer);
+  }
+  const bits = BigUint64Array.from(elements, (e) => elementBits(e, 8));
+  return new Float64Array(bits.buffer);
+}
+
+const bytesOf = (view) => new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
 
 function floorDiv(a, b) {
   let q = a / b;
@@ -98,8 +128,8 @@ function one(typed) {
 
 /**
  * Builds the JavaScript value whose canonical encoding is the vector. `date` and `datetime`
- * have no JavaScript type of their own (Date encodes as a timestamp), so they become Ext(-2)
- * and Ext(-3).
+ * have no JavaScript value at all: `Date` encodes as a timestamp, and SPEC §5.7 forbids
+ * writing their extension ids raw (see `reencodable`).
  */
 export function fromTyped(typed, lib) {
   const [kind, x] = one(typed);
@@ -130,13 +160,11 @@ export function fromTyped(typed, lib) {
     case 'timestamp':
       return new lib.Timestamp(BigInt(x.seconds), x.nanoseconds, x.offset_minutes);
     case 'date':
-      return new lib.Ext(-2, be64(BigInt(x)));
     case 'datetime':
-      return new lib.Ext(-3, be64(BigInt(x)));
+      throw new Error(`${kind} has no JavaScript value that encodes to it`);
     case 'float32_vector':
-      return Float32Array.from(x.map(parseFloatTyped));
     case 'float64_vector':
-      return Float64Array.from(x.map(parseFloatTyped));
+      return vectorOf(kind, x);
     case 'ext':
       return new lib.Ext(x.type, unhex(x.data));
     default:
@@ -145,17 +173,22 @@ export function fromTyped(typed, lib) {
 }
 
 /**
- * False if the value contains a float that JavaScript can't distinguish from an integer
- * (such as 0.0): such a number encodes as an integer, so the vector can't be re-encoded.
+ * False if the value has a part JavaScript has no native type for, so the vector may skip
+ * its re-encoding (SPEC §10):
+ * - a float that JavaScript can't distinguish from an integer (such as 0.0), which encodes
+ *   as an integer;
+ * - a date (-2) or datetime (-3): JavaScript has no such types (a `Date` is a timestamp,
+ *   -1), and SPEC §5.7 forbids writing their ids as a raw `Ext`.
  */
-export function jsRepresentable(typed) {
+export function reencodable(typed) {
   const [kind, x] = one(typed);
   if (kind === 'float') {
     const f = parseFloatTyped(x);
     return !(Number.isSafeInteger(f) && !Object.is(f, -0));
   }
-  if (kind === 'array') return x.every(jsRepresentable);
-  if (kind === 'map') return Object.values(x).every(jsRepresentable);
+  if (kind === 'date' || kind === 'datetime') return false;
+  if (kind === 'array') return x.every(reencodable);
+  if (kind === 'map') return Object.values(x).every(reencodable);
   return true;
 }
 
@@ -256,13 +289,12 @@ export function mismatch(actual, typed, lib, opts, path = '$') {
     }
     case 'float32_vector':
     case 'float64_vector': {
+      // Vectors are opaque buffers: elements compare bit for bit, NaN payloads included.
       const Ctor = kind === 'float32_vector' ? Float32Array : Float64Array;
       if (!(actual instanceof Ctor) || actual.length !== x.length) return bad();
-      for (let i = 0; i < x.length; i++) {
-        const want = kind === 'float32_vector' ? Math.fround(parseFloatTyped(x[i])) : parseFloatTyped(x[i]);
-        if (!sameFloat(actual[i], want)) return bad();
-      }
-      return null;
+      const want = hex(bytesOf(vectorOf(kind, x)));
+      const got = hex(bytesOf(actual));
+      return got === want ? null : bad(`${Ctor.name} with bytes ${got}, expected ${want}`);
     }
     case 'ext':
       return actual instanceof lib.Ext && actual.type === x.type && hex(actual.data) === x.data ? null : bad();

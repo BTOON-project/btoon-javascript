@@ -195,7 +195,7 @@ describe('compression envelope', () => {
       [envelope(0, z, raw.length, { reserved: 1 }), 'invalid_envelope'],
       [envelope(0, z, raw.length, { csize: z.length + 1 }), 'invalid_envelope'],
       [envelope(0, z, raw.length, { csize: z.length - 1 }), 'invalid_envelope'],
-      [envelope(0, z, 256 * 1024 * 1024 + 1), 'size_limit'],
+      [envelope(0, z, 64 * 1024 * 1024 + 1), 'size_limit'], // above the default limit (SPEC §7.1)
       [envelope(9, z, raw.length), 'unsupported_compression'],
       [envelope(0, z, raw.length + 1), 'invalid_envelope'],
       [envelope(0, z, raw.length - 1), 'invalid_envelope'],
@@ -253,13 +253,21 @@ describe('compression envelope', () => {
       assert.ok(performance.now() - t0 < 5000, `${label} took too long`);
     }
     // Declared large but backed by a tiny stream: no huge allocation, just a size mismatch.
-    const tiny = envelope(0, zlib.deflateSync(new Uint8Array(100)), 200 * 1024 * 1024);
+    const tiny = envelope(0, zlib.deflateSync(new Uint8Array(100)), 60 * 1024 * 1024);
     for (const [, decode] of decoders) await rejectsWith(() => decode(tiny), 'invalid_envelope');
-    // A real 64 MiB document under the default 256 MiB limit decodes.
+    // A real 32 MiB document is within the default 64 MiB limit (SPEC §7.1)...
+    const half = node.encode(zeros.subarray(0, 32 * 1024 * 1024), { compress: true });
+    assert.ok(half.length < 100 * 1024);
+    for (const [label, decode] of decoders) {
+      const out = await decode(half);
+      assert.equal(out.length, 32 * 1024 * 1024, label);
+    }
+    // ...but 64 MiB of payload plus its header is above it, unless the limit is raised.
     const big = node.encode(zeros, { compress: true });
     assert.ok(big.length < 200 * 1024);
     for (const [label, decode] of decoders) {
-      const out = await decode(big);
+      await rejectsWith(() => decode(big), 'size_limit').catch((e) => assert.fail(`${label}: ${e.message}`));
+      const out = await decode(big, { maxDecompressedSize: 65 * 1024 * 1024 });
       assert.equal(out.length, zeros.length, label);
     }
   });
@@ -290,20 +298,34 @@ describe('signed envelope', () => {
     }
   });
 
-  test('an empty hmacKey is an error, not "no key" (SPEC §8)', async () => {
+  test('an empty or null hmacKey is an error, not "no key" (SPEC §8)', async () => {
     const sealed = node.encode(1, { hmacKey: key });
-    for (const empty of ['', new Uint8Array(0), Buffer.alloc(0)]) {
-      for (const lib of [node, portable]) {
-        await rejectsWith(() => lib.encode(1, { hmacKey: empty }), 'invalid_argument');
-        await rejectsWith(() => lib.encodeAsync(1, { hmacKey: empty }), 'invalid_argument');
-        for (const input of [sealed, lib.encode(1)]) {
-          await rejectsWith(() => lib.decode(input, { hmacKey: empty }), 'invalid_argument');
-          await rejectsWith(() => lib.decodeAsync(input, { hmacKey: empty }), 'invalid_argument');
+    for (const [name, lib] of Object.entries(builds)) {
+      for (const bad of ['', new Uint8Array(0), Buffer.alloc(0), new Uint8Array(8).subarray(4, 4), null]) {
+        const what = `${name}, hmacKey ${bad === null ? 'null' : `empty ${Object.prototype.toString.call(bad)}`}`;
+        const sync = (fn) => {
+          // The synchronous functions throw, the async ones reject (never throw).
+          assert.throws(fn, isCode('invalid_argument'), what);
+        };
+        sync(() => lib.encode(1, { hmacKey: bad }));
+        sync(() => lib.encode(1, { hmacKey: bad, compress: true }));
+        let p;
+        assert.doesNotThrow(() => {
+          p = lib.encodeAsync(1, { hmacKey: bad });
+        });
+        await assert.rejects(p, isCode('invalid_argument'), what);
+        for (const input of [sealed, lib.encode(1), Uint8Array.of(0xc1)]) {
+          sync(() => lib.decode(input, { hmacKey: bad }));
+          assert.doesNotThrow(() => {
+            p = lib.decodeAsync(input, { hmacKey: bad });
+          });
+          await assert.rejects(p, isCode('invalid_argument'), what);
         }
       }
+      // "No key" is an absent (undefined) hmacKey.
+      assert.equal(lib.decode(lib.encode(1, { hmacKey: undefined }), { hmacKey: undefined }), 1, name);
+      assert.equal(await lib.decodeAsync(await lib.encodeAsync(1, { hmacKey: undefined }), { hmacKey: undefined }), 1, name);
     }
-    // "No key" is an absent (undefined) hmacKey.
-    for (const lib of [node, portable]) assert.equal(lib.decode(lib.encode(1), { hmacKey: undefined }), 1);
   });
 
   test('long keys (> 64 bytes) and binary keys', async () => {

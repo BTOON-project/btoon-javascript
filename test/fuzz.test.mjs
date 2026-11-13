@@ -11,7 +11,7 @@ const SEED = Number(process.env.FUZZ_SEED ?? 0x5eed);
 const KEY = new TextEncoder().encode('fuzz-key-0123456789abcdef0123456');
 
 function seeds(lib) {
-  const out = loadVectors().vectors.map((v) => unhex(v.hex));
+  const out = loadVectors().vectors.filter((v) => v.hex !== undefined).map((v) => unhex(v.hex));
   const rows = Array.from({ length: 12 }, (_, i) => ({
     id: i,
     name: `user${i}`,
@@ -93,6 +93,7 @@ function randomOptions(r) {
   if (r.bool(0.2)) o.bigint = 'always';
   if (r.bool(0.1)) o.hmacKey = KEY;
   if (r.bool(0.1)) o.maxDecompressedSize = r.int(5000);
+  if (r.bool(0.1)) o.maxValues = r.int(60);
   if (r.bool(0.05)) o.autoDecompress = false;
   return o;
 }

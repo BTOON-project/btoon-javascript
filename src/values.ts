@@ -18,12 +18,13 @@ export function isUint8Array(v: unknown): v is Uint8Array {
 /**
  * A generic MessagePack extension value: a signed 8-bit type id and an opaque payload.
  *
- * Decoding returns `Ext` for every extension id BTOON does not define (application ids
- * 0…127 and the reserved negative ids). Encoding writes it verbatim with the smallest
- * header. An `Ext` may also carry one of the ids BTOON defines (-1…-6, -10) — this is how
- * to emit a `date` (-2) or `datetime` (-3) value, which have no JavaScript type of their
- * own — but its payload must then be well-formed for that type, or encoding fails with
- * `invalid_argument`.
+ * Decoding returns `Ext` for every extension id BTOON does not define: application ids
+ * 0…127, and the ids reserved for future BTOON versions (-7…-9, -11…-128). Encoding writes
+ * those verbatim with the smallest header. The ids BTOON defines (-1…-6 and -10) can't be
+ * written raw (SPEC §5.7): encoding such an `Ext` throws `invalid_argument`, because a
+ * verbatim payload could be malformed or non-canonical. Those types are written from their
+ * typed values (`Date`/{@link Timestamp}, `bigint`, `Float32Array`/`Float64Array`, arrays of
+ * objects). The constructor itself accepts them, like the other BTOON libraries.
  */
 export class Ext {
   /** Extension type id, an integer in [-128, 127]. */

@@ -1,8 +1,8 @@
 /** Version of this library. */
-export const VERSION = '0.1.2' as const;
+export const VERSION = '0.2.0' as const;
 
 /** Version of the BTOON specification this library implements. */
-export const SPEC_VERSION = '0.1' as const;
+export const SPEC_VERSION = '0.2' as const;
 
 // Extension type ids (SPEC §5).
 export const EXT_TIMESTAMP = -1;
@@ -17,8 +17,12 @@ export const TABULAR_VERSION = 1;
 export const MAX_OFFSET_MINUTES = 1080;
 export const NANOS_PER_SECOND = 1_000_000_000;
 
+// Resource limits (SPEC §7.1).
 export const DEFAULT_MAX_DEPTH = 128;
-export const DEFAULT_MAX_DECOMPRESSED_SIZE = 256 * 1024 * 1024;
+/** The largest `maxDepth` a caller may set (SPEC §7); a deeper limit could exhaust the stack. */
+export const MAX_DEPTH_LIMIT = 1000;
+export const DEFAULT_MAX_DECOMPRESSED_SIZE = 64 * 1024 * 1024;
+export const DEFAULT_MAX_VALUES = 2 ** 20;
 
 /** Encoders SHOULD skip compression below this size (SPEC §6). */
 export const MIN_COMPRESSION_SIZE = 256;

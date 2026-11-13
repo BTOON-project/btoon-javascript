@@ -9,15 +9,16 @@ compression envelope and an optional HMAC-signed envelope.
 - **Pure TypeScript, zero runtime dependencies.** Runs in browsers, Node.js ≥ 18, Deno,
   Bun and edge runtimes (Cloudflare Workers, Vercel Edge). ESM and CommonJS builds with
   type definitions.
-- **Conforming.** Implements [BTOON spec 0.1](https://github.com/BTOON-project/btoon-core/blob/main/docs/SPEC.md)
-  and passes all 260 conformance vectors of btoon-core (see [Conformance](#conformance)).
+- **Conforming.** Implements [BTOON spec 0.2](https://github.com/BTOON-project/btoon-core/blob/main/docs/SPEC.md)
+  and passes all 298 conformance vectors of btoon-core (see [Conformance](#conformance)).
 - **Canonical.** The same value encodes to the same bytes as in every other conforming
   implementation (C++, Python, Go, PHP), so encodings can be hashed, cached and signed.
 - **Hardened decoder.** Bounds-checked reads, a nesting limit, no allocation larger than
-  the input justifies, strict UTF-8, duplicate-key rejection, capped decompression, and
-  signatures verified before anything is parsed.
+  the input justifies, a limit on how many values a document decodes to, strict UTF-8,
+  duplicate-key rejection, capped decompression, and signatures verified before anything
+  is parsed (see [Limits](#limits)).
 
-Implements spec 0.1. In Node.js it is also the fastest BTOON package: on
+Implements spec 0.2. In Node.js it is also the fastest BTOON package: on
 10,000 records it encodes in 1.1 ms and decodes in 1.6 ms, against 7.8 ms and 7.1 ms for
 the native [`btoon`](https://github.com/BTOON-project/btoon-nodejs) addon, with
 byte-identical output.
@@ -151,7 +152,7 @@ Encoding (JavaScript → BTOON):
 | plain object, `Map` with string keys | map, keys sorted by UTF-8 bytes |
 | `Date` | timestamp (millisecond precision, UTC) |
 | `Timestamp` | timestamp (nanoseconds, optional UTC offset) |
-| `Ext` | extension, written as is |
+| `Ext` | extension, written as is. An id BTOON defines (-1…-6, -10) throws `invalid_argument` (SPEC §5.7) |
 | other objects | like `JSON.stringify`: the result of `toJSON()` if present (called once), else the object's own enumerable string-keyed properties. `Number`/`String`/`Boolean`/`BigInt` wrappers are unwrapped |
 | functions, symbols | `invalid_argument` |
 
@@ -179,9 +180,14 @@ Notes:
 - **Key order.** Keys are sorted by their UTF-8 bytes, which is not JavaScript's default
   `sort()` order for characters outside the Basic Multilingual Plane.
 - **`date` and `datetime`.** These extension types have no JavaScript type of their own and
-  decode to `Date` (or `Timestamp`). To write one, use `new Ext(-2, bytes)` (int64
-  milliseconds) or `new Ext(-3, bytes)` (int64 nanoseconds). An `Ext` with an id BTOON
-  defines must carry a valid payload for that type, or `encode` throws `invalid_argument`.
+  decode to `Date` (or `Timestamp`). @btoon/js doesn't write them: `Date` and `Timestamp`
+  encode as timestamps (-1), and a raw `Ext` can't carry their ids (see the next note).
+- **`Ext` with an id BTOON defines.** Since spec 0.2, `encode` throws `invalid_argument` for
+  an `Ext` whose id is one BTOON defines (-1…-6 for timestamp, date, datetime, bigint and
+  the vectors, -10 for tabular), even when its payload is valid (SPEC §5.7). Written
+  verbatim, a payload could be malformed or non-canonical; those types are written from
+  their typed values. The `Ext` constructor still accepts these ids, as in the other BTOON
+  libraries. Ids reserved for future versions (-7…-9, -11…-128) are written as given.
 - **Cycles** throw `max_depth`, like any value nested deeper than `maxDepth`.
 - `Ext` and `Timestamp` are recognised through `Symbol.for('btoon.Ext')` and
   `Symbol.for('btoon.Timestamp')` brands, so instances from the ESM and CommonJS builds
@@ -190,8 +196,8 @@ Notes:
 ## API
 
 ```ts
-const VERSION: '0.1.2';
-const SPEC_VERSION: '0.1';
+const VERSION: '0.2.0';
+const SPEC_VERSION: '0.2';
 
 function encode(value: unknown, options?: EncodeOptions): Uint8Array;
 function decode(data: Uint8Array | ArrayBuffer | ArrayBufferView, options?: DecodeOptions): unknown;
@@ -219,24 +225,51 @@ the buffer right away. The async functions report every failure as a rejected pr
 | `compress` | `false` | Wrap in a compression envelope. |
 | `compression` | `'zlib'` | `'zlib'`, `'lz4'`, `'zstd'`, `'brotli'` or `'snappy'`. Only used when `compress` is true. |
 | `autoTabular` | `true` | Use the tabular encoding where the size rule says so. |
-| `maxDepth` | `128` | Nesting limit. Deeper or cyclic values throw `max_depth`. |
-| `hmacKey` | none | `Uint8Array` or string (its UTF-8 bytes). Signs the output. Must not be empty. |
+| `maxDepth` | `128` | Nesting limit, at most 1000. Deeper or cyclic values throw `max_depth`. |
+| `hmacKey` | none | `Uint8Array` or string (its UTF-8 bytes). Signs the output. An empty key or `null` throws `invalid_argument`: leave the option out for no signature. |
 | `codecs` | none | Caller-supplied compression codecs. |
 
 ### Decode options
 
 | Option | Default | Meaning |
 |---|---|---|
-| `strict` | `true` | SPEC §7 strict mode. `false` allows trailing bytes and duplicate map keys (last wins) and replaces invalid UTF-8 with U+FFFD. Bounds, depth, allocation and other structural checks are never relaxed. |
-| `maxDepth` | `128` | Nesting limit. A tabular array counts two levels. |
-| `maxDecompressedSize` | 256 MiB | Largest accepted `uncompressed_size`, checked before decompressing. |
+| `strict` | `true` | SPEC §7 strict mode. `false` allows trailing bytes and duplicate map keys (last wins), and replaces invalid UTF-8 in string values with U+FFFD. Map keys and column names must be valid UTF-8 either way, and bounds, depth, size, allocation and other structural checks are never relaxed. |
+| `maxDepth` | `128` | Nesting limit, at most 1000. A tabular array counts two levels. |
+| `maxDecompressedSize` | 64 MiB | Largest accepted `uncompressed_size`, checked before decompressing. Also bounds the column-name bytes a table copies into its rows. |
+| `maxValues` | 1,048,576 (2^20) | Largest number of values a document may decode to. See [Limits](#limits). |
 | `autoDecompress` | `true` | Accept compression envelopes; `false` rejects them with `invalid_envelope`. |
-| `hmacKey` | none | Require a signed envelope and verify it before parsing. Must not be empty. |
+| `hmacKey` | none | Require a signed envelope and verify it before parsing. An empty key or `null` throws `invalid_argument`: leave the option out for no key. |
 | `timestamps` | `'date'` | `'date'` or `'object'` (always `Timestamp`, full precision). |
 | `bigint` | `'auto'` | `'auto'` or `'always'`. |
 | `codecs` | none | Caller-supplied compression codecs. |
 
-Invalid options throw `invalid_argument`. Unknown option names are ignored.
+Invalid options throw `invalid_argument`, before any input is read. Unknown option names
+are ignored.
+
+### Limits
+
+Decoding enforces SPEC §7.1's limits, so a small hostile input can't make it allocate
+gigabytes. Exceeding one fails with `size_limit` (`max_depth` for nesting):
+
+- **`maxValues`** (default 2^20) bounds how many values a document decodes to. A value
+  counts once, when it starts, before anything inside it: the top-level value, every array
+  element, every map value (keys don't count), and every extension value (timestamp,
+  bigint, vector, …). A tabular array counts once, then its rows once its header is checked,
+  then each cell, so it counts the same as the equivalent plain array of maps. Values inside
+  a compression envelope count; the envelopes don't.
+- **`maxDecompressedSize`** (default 64 MiB) bounds a compression envelope's declared size
+  and, for every table, rows × the UTF-8 bytes of its column names, which is what decoders
+  copy into the row maps.
+- **`maxDepth`** (default 128, at most 1000) bounds nesting.
+
+With the defaults, the worst hostile input we found takes about 0.6 GB to decode. The
+costliest values in V8 are those with a buffer of their own: a 64 KB envelope that expands
+to 2^20 empty float vectors peaked at 0.59 GB of process memory in Node.js 22 (0.66 GB
+with the portable entry, whose pure-JS inflate holds more of the 64 MiB payload), against
+0.51 GB for `Ext` values, 0.44 GB for binaries and 0.31 GB for empty maps. Tables cost
+less per value than maps. Applications that decode larger documents raise `maxValues` (or
+`maxDecompressedSize`); those that decode untrusted input should keep the defaults, or
+lower them where memory is tight.
 
 ## Errors
 
@@ -247,17 +280,17 @@ Every failure is a `BtoonError` whose `code` is stable across BTOON implementati
 | `truncated` | Input ends before a value is complete, or a length runs past the input. |
 | `invalid_marker` | The reserved byte `0xc1`. |
 | `trailing_data` | Bytes after the top-level value (strict mode). |
-| `invalid_utf8` | A string, key or column name isn't valid UTF-8, or a string to encode has a lone surrogate. |
+| `invalid_utf8` | A string (strict mode), map key or column name isn't valid UTF-8, or a string to encode has a lone surrogate. |
 | `non_string_key` | A map key that isn't a string. |
 | `duplicate_key` | The same map key twice (strict mode). |
 | `max_depth` | Nesting deeper than `maxDepth`, or a cyclic value. |
 | `invalid_extension` | A malformed timestamp, date, datetime, bigint or vector payload. |
 | `invalid_tabular` | A malformed tabular payload. |
 | `invalid_envelope` | A malformed envelope, or a compressed payload that is corrupt, has trailing bytes, or decompresses to a size other than the declared one. |
-| `size_limit` | A declared size above `maxDecompressedSize`, or a value too large for the engine. |
+| `size_limit` | More values than `maxValues`, a declared size or a table's copied column names above `maxDecompressedSize`, or a value too large for the engine. |
 | `unsupported_compression` | An unknown algorithm id, or one not available in this environment. |
 | `authentication_failed` | A missing or invalid signature, or a signed input decoded without a key. |
-| `invalid_argument` | A value that can't be encoded, or an invalid option. |
+| `invalid_argument` | A value that can't be encoded (including an `Ext` with an id BTOON defines), or an invalid option (including an empty or `null` `hmacKey`, or `maxDepth` above 1000). |
 
 ```js
 try {
@@ -274,24 +307,31 @@ Exceptions thrown by your own `toJSON()` methods or getters propagate unchanged.
 Decoding is designed for hostile input (SPEC §7, §9): every read is bounds-checked; arrays,
 maps and tables are checked against the remaining input before anything is allocated, and
 grow as their elements are decoded instead of reserving what their headers announce; the
-nesting limit applies to input and output; strings are validated with a fatal
-`TextDecoder`; compressed payloads are checked against `maxDecompressedSize` before
-decompressing and stopped at their declared size while decompressing; Zstandard frames
+document's values and its tables' copied column names are limited (see [Limits](#limits));
+the nesting limit applies to input and output; strings are validated with a fatal
+`TextDecoder`, and map keys and column names are validated in non-strict mode too, so two
+distinct keys can never merge; compressed payloads are checked against
+`maxDecompressedSize` before decompressing and stopped at their declared size while
+decompressing; zlib streams that use a preset dictionary are rejected; Zstandard frames
 whose window exceeds max(8 MiB, min(declared size, 128 MiB)) are rejected; HMACs are
-compared in constant time and checked before the payload is parsed. Raising `maxDepth`
-far above the default is safe: exhausting the JavaScript stack is reported as
+compared in constant time and checked before the payload is parsed. `maxDepth` can't
+exceed 1000, and should the JavaScript stack still run out, that is reported as
 `max_depth`.
 
 ## Conformance
 
 The test suite runs btoon-core's conformance vectors (vendored in `test/vectors/`) against
-the ESM and CommonJS builds of both entry points, synchronously and asynchronously: every
-non-error vector must decode to its value, every canonical vector must re-encode
-byte-for-byte, and every error vector must fail with its error code. All 260 pass, with
-these exceptions:
+the ESM and CommonJS builds of both entry points, synchronously and asynchronously, with
+each vector's options: every non-error vector must decode to its value (float vectors bit
+for bit), every canonical vector must re-encode byte-for-byte, every error vector must fail
+with its error code, and every `encode_error` vector's value must be refused with its code.
+All 298 pass, with these exceptions:
 
-- `float/0` is not re-encoded: the float `0.0` is indistinguishable from the integer `0`
-  in JavaScript (it is still decoded and checked).
+- Seven canonical vectors are decoded and checked but not re-encoded, as SPEC §10 allows
+  for values an implementation has no native type for: `float/0` (the float `0.0` is the
+  integer `0` in JavaScript), and the five `date/*` and `datetime/*` vectors and
+  `tabular/type-code-9-variants` (JavaScript has no date or datetime type, and SPEC §5.7
+  forbids writing their ids raw).
 - Vectors that need an optional codec are skipped where it is missing: LZ4 everywhere;
   Brotli and Zstandard in the portable entry without `codecs` (and Zstandard on
   Node.js < 22.15).
