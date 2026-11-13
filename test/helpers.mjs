@@ -3,6 +3,7 @@
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+import zlib from 'node:zlib';
 
 const require = createRequire(import.meta.url);
 
@@ -286,4 +287,71 @@ export function rng(seed) {
     pick: (arr) => arr[Math.floor(next() * arr.length)],
     bool: (p = 0.5) => next() < p,
   };
+}
+
+/** A compression envelope (SPEC §6) of algorithm id `algo` around `payload`. */
+export function compressionEnvelope(algo, payload, usize) {
+  const out = new Uint8Array(16 + payload.length);
+  out.set([0x42, 0x54, 0x4f, 0x4e, 1, algo, 0, 0]);
+  const v = new DataView(out.buffer);
+  v.setUint32(8, payload.length);
+  v.setUint32(12, usize);
+  out.set(payload, 16);
+  return out;
+}
+
+function concatBytes(...parts) {
+  return new Uint8Array(Buffer.concat(parts.map((p) => Buffer.from(p))));
+}
+
+/**
+ * Compressed payloads on which decodeAsync must reach decode's verdict (review 2026-11-13,
+ * X2): valid streams, streams followed by junk (one variant ends in a copy of the zlib
+ * stream's Adler-32), a zlib stream that requires a preset dictionary, and Zstandard frames
+ * whose window exceeds the SPEC §6 bound. Returns [name, envelope] pairs for the bare
+ * document `doc`.
+ */
+export function compressedCases(doc) {
+  const junk = new TextEncoder().encode('ANY BYTES AN ATTACKER LIKES');
+  const z = zlib.deflateSync(doc);
+  const br = zlib.brotliCompressSync(doc);
+  const cases = [
+    ['zlib', compressionEnvelope(0, z, doc.length)],
+    ['zlib + junk', compressionEnvelope(0, concatBytes(z, [1, 2, 3]), doc.length)],
+    ['zlib + junk ending in its Adler-32', compressionEnvelope(0, concatBytes(z, junk, z.subarray(z.length - 4)), doc.length)],
+    ['zlib + second stream', compressionEnvelope(0, concatBytes(z, z), doc.length)],
+    ['zlib with FDICT', unhex('42544f4e01000000000000120000000678bb000000015b9a919a93930f000a0b02ba')],
+    ['brotli', compressionEnvelope(3, br, doc.length)],
+    ['brotli + junk', compressionEnvelope(3, concatBytes(br, junk), doc.length)],
+    ['brotli + one byte', compressionEnvelope(3, concatBytes(br, [0]), doc.length)],
+  ];
+  if (typeof zlib.zstdCompressSync === 'function') {
+    const C = zlib.constants;
+    const zs = zlib.zstdCompressSync(doc);
+    const frame = new Uint8Array(zlib.zstdCompressSync(doc, { params: { [C.ZSTD_c_windowLog]: 20, [C.ZSTD_c_contentSizeFlag]: 0 } }));
+    const withWindow = (log) => {
+      const f = Uint8Array.from(frame);
+      f[5] = (log - 10) << 3; // Window_Descriptor: the frame declares a 2^log window
+      return compressionEnvelope(2, f, doc.length);
+    };
+    cases.push(
+      ['zstd', compressionEnvelope(2, zs, doc.length)],
+      ['zstd + junk', compressionEnvelope(2, concatBytes(zs, junk), doc.length)],
+      ['zstd + second frame', compressionEnvelope(2, concatBytes(zs, zs), doc.length)],
+      ['zstd, 8 MiB window', withWindow(23)],
+      ['zstd, 16 MiB window', withWindow(24)],
+      ['zstd, 128 MiB window', withWindow(27)],
+    );
+  }
+  return cases;
+}
+
+/** The value a (possibly async) call returns, or the code of the BtoonError it throws. */
+export async function verdict(fn) {
+  try {
+    return { value: await fn() };
+  } catch (e) {
+    if (e?.name !== 'BtoonError') throw e;
+    return { code: e.code };
+  }
 }

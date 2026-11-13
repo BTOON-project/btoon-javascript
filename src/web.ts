@@ -1,10 +1,12 @@
 // Asynchronous implementations on top of web platform APIs: Compression Streams and
 // WebCrypto. Used by encodeAsync/decodeAsync wherever the runtime provides them.
 import { BtoonError, fail } from './errors.js';
-import { adler32 } from './inflate.js';
 import type { CompressionAlgorithm } from './options.js';
 
 const FORMATS: Partial<Record<CompressionAlgorithm, string>> = { zlib: 'deflate', brotli: 'brotli', zstd: 'zstd' };
+// DecompressionStream has no way to bound a Zstandard window (SPEC §6), so it is never used
+// for zstd.
+const DECOMPRESSION_FORMATS: Partial<Record<CompressionAlgorithm, string>> = { zlib: 'deflate', brotli: 'brotli' };
 const CHUNK = 64 * 1024;
 
 type StreamCtor = new (format: string) => { readonly readable: ReadableStream<Uint8Array>; readonly writable: WritableStream<Uint8Array> };
@@ -46,6 +48,77 @@ function concat(chunks: Uint8Array[], total: number): Uint8Array {
   return out;
 }
 
+function fromHex(h: string): Uint8Array {
+  const out = new Uint8Array(h.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(h.slice(2 * i, 2 * i + 2), 16);
+  return out;
+}
+
+// Streams of the five bytes "BTOON" (zlib level 9, Brotli quality 11) for the trust probe.
+const PROBE_TEXT = 'BTOON';
+const PROBE_STREAMS: Record<string, string> = { deflate: '78da730af1f7f7030004780183', brotli: '0b028042544f4f4e03' };
+
+const trust = new Map<string, Promise<boolean>>();
+
+/**
+ * Whether this runtime's DecompressionStream can be trusted with `format`: it must decode a
+ * valid stream and reject one followed by a byte (in the same write or in the next), or by a
+ * second stream. Node.js 18 to 23 (some later 22.x releases excepted) ignore bytes after a
+ * zlib stream, and Node.js 22 and 24 after a Brotli stream, while SPEC §6 requires
+ * `invalid_envelope`. Checked once per format.
+ */
+function trusted(format: string): Promise<boolean> {
+  let p = trust.get(format);
+  if (p === undefined) {
+    p = probe(format);
+    trust.set(format, p);
+  }
+  return p;
+}
+
+async function probe(format: string): Promise<boolean> {
+  const hex = PROBE_STREAMS[format];
+  if (hex === undefined) return false;
+  const valid = fromHex(hex);
+  const next = (extra: Uint8Array): Uint8Array => {
+    const out = new Uint8Array(valid.length + extra.length);
+    out.set(valid);
+    out.set(extra, valid.length);
+    return out;
+  };
+  try {
+    const out = await decompressChunks(format, [valid], 64, format);
+    if (String.fromCharCode(...out) !== PROBE_TEXT) return false;
+  } catch {
+    return false;
+  }
+  for (const chunks of [[next(Uint8Array.of(0))], [valid, Uint8Array.of(0)], [next(valid)]]) {
+    try {
+      await decompressChunks(format, chunks, 64, format);
+      return false; // trailing bytes accepted
+    } catch {
+      // rejected, as it should be
+    }
+  }
+  return true;
+}
+
+/**
+ * The DecompressionStream format that decodeAsync may use for `alg` when no other
+ * decompressor is available, or undefined: never for zstd, and only once the runtime has
+ * shown that it rejects trailing bytes.
+ */
+export async function trustedDecompressionFormat(alg: CompressionAlgorithm): Promise<string | undefined> {
+  const format = DECOMPRESSION_FORMATS[alg];
+  if (format === undefined || webFormat(alg, 'DecompressionStream') === undefined) return undefined;
+  return (await trusted(format)) ? format : undefined;
+}
+
+/** Whether decodeAsync might decompress `alg` with a DecompressionStream here (for error messages). */
+export function mayDecompressAsync(alg: CompressionAlgorithm): boolean {
+  return DECOMPRESSION_FORMATS[alg] !== undefined && webFormat(alg, 'DecompressionStream') !== undefined;
+}
+
 async function readAll(reader: ReadableStreamDefaultReader<Uint8Array>, limit: number, alg: string): Promise<Uint8Array> {
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -62,11 +135,18 @@ async function readAll(reader: ReadableStreamDefaultReader<Uint8Array>, limit: n
   return concat(chunks, total);
 }
 
-/** Feeds `data` in chunks, honouring backpressure, then closes the writer. */
-async function pump(writer: WritableStreamDefaultWriter<Uint8Array>, data: Uint8Array): Promise<void> {
-  for (let i = 0; i < data.length; i += CHUNK) {
+/** Splits `data` into the chunks written to a stream. */
+function chunked(data: Uint8Array): Uint8Array[] {
+  const chunks: Uint8Array[] = [];
+  for (let i = 0; i < data.length; i += CHUNK) chunks.push(data.subarray(i, Math.min(i + CHUNK, data.length)));
+  return chunks;
+}
+
+/** Writes `chunks`, honouring backpressure, then closes the writer. */
+async function pump(writer: WritableStreamDefaultWriter<Uint8Array>, chunks: readonly Uint8Array[]): Promise<void> {
+  for (const chunk of chunks) {
     await writer.ready;
-    await writer.write(data.subarray(i, Math.min(i + CHUNK, data.length)));
+    await writer.write(chunk);
   }
   await writer.close();
 }
@@ -78,7 +158,7 @@ function messageOf(e: unknown): string {
 export async function webCompress(format: string, data: Uint8Array): Promise<Uint8Array> {
   const stream = new (streamCtor('CompressionStream')!)(format);
   const writer = stream.writable.getWriter();
-  const writing = pump(writer, data);
+  const writing = pump(writer, chunked(data));
   writing.catch(() => undefined);
   const out = await readAll(stream.readable.getReader(), Infinity, format);
   await writing;
@@ -86,31 +166,36 @@ export async function webCompress(format: string, data: Uint8Array): Promise<Uin
 }
 
 /**
- * Decompresses with a DecompressionStream, stopping as soon as the output exceeds
- * `limit` (the declared size). For zlib it also checks that the payload ends with the
- * Adler-32 of the output: older runtimes silently ignore bytes after the end of the
- * stream, which a strict decoder must reject.
+ * Runs `chunks` through a DecompressionStream. Output beyond `limit` bytes fails with
+ * `invalid_envelope` ("<label> payload decompresses to more than the declared size").
  */
-export async function webDecompress(alg: CompressionAlgorithm, format: string, data: Uint8Array, limit: number): Promise<Uint8Array> {
+async function decompressChunks(format: string, chunks: readonly Uint8Array[], limit: number, label: string): Promise<Uint8Array> {
   const stream = new (streamCtor('DecompressionStream')!)(format);
   const writer = stream.writable.getWriter();
-  const writing = pump(writer, data);
+  const writing = pump(writer, chunks);
   writing.catch(() => undefined);
-  let out: Uint8Array;
   try {
-    out = await readAll(stream.readable.getReader(), limit, alg);
+    const out = await readAll(stream.readable.getReader(), limit, label);
     await writing;
+    return out;
   } catch (e) {
     writer.abort(e).catch(() => undefined);
+    throw e;
+  }
+}
+
+/**
+ * Decompresses with a DecompressionStream, stopping as soon as the output exceeds `limit`
+ * (the declared size). Only for a format that trustedDecompressionFormat() returned, which
+ * rejects bytes after the end of the stream.
+ */
+export async function webDecompress(alg: CompressionAlgorithm, format: string, data: Uint8Array, limit: number): Promise<Uint8Array> {
+  try {
+    return await decompressChunks(format, chunked(data), limit, alg);
+  } catch (e) {
     if (e instanceof BtoonError) throw e;
     throw fail('invalid_envelope', `${alg} payload is corrupt: ${messageOf(e)}`, e);
   }
-  if (alg === 'zlib') {
-    const n = data.length;
-    const trailer = n >= 4 ? ((data[n - 4]! << 24) | (data[n - 3]! << 16) | (data[n - 2]! << 8) | data[n - 1]!) >>> 0 : -1;
-    if (trailer !== adler32(out)) throw fail('invalid_envelope', 'zlib payload has trailing bytes');
-  }
-  return out;
 }
 
 type Subtle = {

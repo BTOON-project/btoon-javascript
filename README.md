@@ -94,13 +94,20 @@ API; they differ only in which synchronous codecs are built in.
 | `decode` of Brotli / Zstandard | `node:zlib` (Zstandard from Node.js 22.15) | `options.codecs` |
 | `encode` with `compress` | zlib, Brotli, Zstandard via `node:zlib` | `options.codecs`, otherwise `unsupported_compression` (use `encodeAsync`) |
 | HMAC in `encode`/`decode` | `node:crypto` | built-in pure-JS SHA-256 |
-| `encodeAsync` / `decodeAsync` compression | `CompressionStream` / `DecompressionStream` where the runtime supports the format, else the synchronous codecs | the same |
+| `encodeAsync` compression | `CompressionStream` where the runtime supports the format, else `node:zlib` | `CompressionStream` where the runtime supports the format |
+| `decodeAsync` decompression | `node:zlib` on its thread pool | the pure-JS inflate for zlib; Brotli through `DecompressionStream` where it proves strict (see below) |
 | `encodeAsync` / `decodeAsync` HMAC | WebCrypto (`crypto.subtle`), else `node:crypto` | WebCrypto, else pure JS (for example on `http://` pages) |
 | LZ4, Snappy | `options.codecs` | `options.codecs` |
 
-`DecompressionStream('deflate')` is the RFC 1950 zlib format the spec requires. Other
-formats depend on the runtime: at the time of writing, Brotli streams exist in Node.js 22+
-and Bun, and Zstandard streams in Bun.
+`decodeAsync` accepts and rejects exactly what `decode` does, because it uses the same
+decompressors: `node:zlib`'s asynchronous functions in the Node entry, and the pure-JS
+inflate in the portable entry. Only where the portable entry has no decompressor of its
+own (Brotli) does it use a `DecompressionStream`, and only after checking once that the
+runtime rejects bytes after the end of a stream: Node.js 18 to 23 accept them after a zlib
+stream (some later 22.x releases excepted), and Node.js 22 and 24 after a Brotli stream. Zstandard never goes through a
+`DecompressionStream`, which can't limit the window size (SPEC §6). Which formats
+`CompressionStream` supports depends on the runtime: at the time of writing, Brotli streams
+exist in Node.js 22+ and Bun, and Zstandard streams in Bun.
 
 Why a pure-JS inflate and SHA-256 in the portable entry: zlib decoding is mandatory in
 the spec and signatures are a security feature, so synchronous `decode` handles both in
@@ -183,7 +190,7 @@ Notes:
 ## API
 
 ```ts
-const VERSION: '0.1.1';
+const VERSION: '0.1.2';
 const SPEC_VERSION: '0.1';
 
 function encode(value: unknown, options?: EncodeOptions): Uint8Array;
@@ -265,7 +272,8 @@ Exceptions thrown by your own `toJSON()` methods or getters propagate unchanged.
 ## Security
 
 Decoding is designed for hostile input (SPEC §7, §9): every read is bounds-checked; arrays,
-maps and tables are checked against the remaining input before anything is allocated; the
+maps and tables are checked against the remaining input before anything is allocated, and
+grow as their elements are decoded instead of reserving what their headers announce; the
 nesting limit applies to input and output; strings are validated with a fatal
 `TextDecoder`; compressed payloads are checked against `maxDecompressedSize` before
 decompressing and stopped at their declared size while decompressing; Zstandard frames

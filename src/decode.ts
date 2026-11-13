@@ -1,7 +1,8 @@
 // Hardened BTOON decoder (SPEC §7). Invariants:
 //  * every read is bounds-checked against `end` (no reads past the input);
 //  * containers are depth-limited (max_depth) — no unbounded recursion;
-//  * nothing is allocated beyond what the remaining input could encode.
+//  * nothing is allocated beyond what the remaining input could encode, and what containers
+//    allocate before their elements are decoded is bounded for the whole document.
 import {
   DEFAULT_MAX_DEPTH,
   EXT_BIGINT,
@@ -33,6 +34,16 @@ const fromCharCode = String.fromCharCode;
 const KEY_CACHE_SIZE = 4096;
 const KEY_CACHE_MAX_LEN = 16;
 const keyCache: (string | undefined)[] = new Array<string | undefined>(KEY_CACHE_SIZE).fill(undefined);
+
+// Limits on what containers allocate before their elements are decoded. A header may announce
+// as many elements as there are bytes left, but nested containers announce the same bytes
+// again at every level, so trusting the counts let a 1 MiB document of 64 nested tabulars
+// build 4 GB of rows and exhaust the heap (review 2026-11-13, X1). An array, or the row list
+// of a table, reserves at most MAX_RESERVE slots, and those open at any time at most
+// RESERVE_BUDGET together; beyond that they grow as elements are decoded. Each tabular row is
+// created once its first cell has been decoded.
+const MAX_RESERVE = 1024;
+const RESERVE_BUDGET = 64 * MAX_RESERVE;
 
 const HEX: string[] = [];
 for (let i = 0; i < 256; i++) HEX.push((i < 16 ? '0' : '') + i.toString(16));
@@ -70,6 +81,8 @@ class Decoder {
   readonly maxDepth: number;
   readonly tsObjects: boolean;
   readonly bigAlways: boolean;
+  /** Slots reserved by the arrays and row lists being decoded (see reserve). */
+  private reserved = 0;
 
   constructor(bytes: Uint8Array, strict: boolean, maxDepth: number, tsObjects: boolean, bigAlways: boolean) {
     this.bytes = plainBytes(bytes);
@@ -235,12 +248,24 @@ class Decoder {
     return b;
   }
 
+  /**
+   * How many of the `n` elements that an array, or a table's row list, announces it may
+   * allocate up front. They are charged to the document's budget until it is complete.
+   */
+  private reserve(n: number): number {
+    const r = Math.min(n, MAX_RESERVE, RESERVE_BUDGET - this.reserved);
+    this.reserved += r;
+    return r;
+  }
+
   private array(n: number, depth: number): unknown[] {
     if (depth >= this.maxDepth) throw this.err('max_depth', 'maximum nesting depth exceeded');
     // Every element takes at least one byte.
     if (n > this.end - this.pos) throw this.err('truncated', 'array length exceeds the remaining input');
-    const a = new Array<unknown>(n);
+    const r = this.reserve(n);
+    const a = new Array<unknown>(r); // grows as elements beyond the reservation arrive
     for (let i = 0; i < n; i++) a[i] = this.value(depth + 1);
+    this.reserved -= r;
     return a;
   }
 
@@ -446,7 +471,7 @@ class Decoder {
     if (cols === 0 && rowCount > 0) throw bad('tabular rows without columns');
     // Each column needs at least 9 bytes: name length, type code, column length.
     if (cols > (end - p) / 9) throw bad('tabular column count exceeds the payload');
-    const names = new Array<string>(cols);
+    const names: string[] = [];
     for (let c = 0; c < cols; c++) {
       if (end - p < 4) throw bad('tabular payload truncated');
       const n = view.getUint32(p);
@@ -454,7 +479,7 @@ class Decoder {
       if (n > end - p) throw bad('tabular column name runs past the payload');
       const name = decodeUtf8(this.bytes, p, n, this.strict);
       if (name === undefined) throw this.err('invalid_utf8', 'column name is not valid UTF-8', p);
-      names[c] = name;
+      names.push(name);
       p += n;
     }
     if (new Set(names).size !== cols) throw bad('duplicate tabular column name');
@@ -462,8 +487,10 @@ class Decoder {
     p += cols; // type codes are informational (SPEC §5.6.1)
     // Every cell is at least one byte.
     if (rowCount * cols > end - p) throw bad('tabular row count exceeds the payload');
-    const rows = new Array<Record<string, unknown>>(rowCount);
-    for (let r = 0; r < rowCount; r++) rows[r] = {};
+    // Each row is created once its first cell has been decoded, so the rows are backed by
+    // input actually consumed, however many the header announces.
+    const reserved = this.reserve(rowCount);
+    const rows = new Array<Record<string, unknown>>(reserved);
     const savedEnd = this.end;
     for (let c = 0; c < cols; c++) {
       if (end - p < 4) throw bad('tabular payload truncated');
@@ -475,7 +502,14 @@ class Decoder {
       this.pos = p;
       this.end = colEnd;
       try {
-        if (name === '__proto__') {
+        if (c === 0) {
+          for (let r = 0; r < rowCount; r++) {
+            const v = this.value(depth + 2);
+            const row: Record<string, unknown> = {};
+            setProperty(row, name, v);
+            rows[r] = row;
+          }
+        } else if (name === '__proto__') {
           for (let r = 0; r < rowCount; r++) setProperty(rows[r]!, name, this.value(depth + 2));
         } else {
           for (let r = 0; r < rowCount; r++) rows[r]![name] = this.value(depth + 2);
@@ -490,6 +524,7 @@ class Decoder {
       p = colEnd;
     }
     this.end = savedEnd;
+    this.reserved -= reserved;
     if (p !== end) throw bad('trailing bytes in tabular payload');
     this.pos = end;
     return rows;
