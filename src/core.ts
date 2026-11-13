@@ -21,12 +21,26 @@ import {
   type EncodeOptions,
 } from './options.js';
 import { isUint8Array } from './values.js';
-import { subtle, webCompress, webDecompress, webFormat, webHmacSign, webHmacVerify } from './web.js';
+import {
+  mayDecompressAsync,
+  subtle,
+  trustedDecompressionFormat,
+  webCompress,
+  webDecompress,
+  webFormat,
+  webHmacSign,
+  webHmacVerify,
+} from './web.js';
 
-/** Synchronous building blocks of one environment. */
+/** Building blocks of one environment: its synchronous codecs and HMAC, and non-blocking decompressors. */
 export interface Platform {
   /** Decompressors; `size` is the declared uncompressed size (already checked against the limit). */
   readonly decompress: Readonly<Partial<Record<CompressionAlgorithm, (data: Uint8Array, size: number) => Uint8Array>>>;
+  /**
+   * Non-blocking forms of `decompress` that reach the same verdict (node:zlib on the thread
+   * pool). decodeAsync prefers them.
+   */
+  readonly decompressAsync?: Readonly<Partial<Record<CompressionAlgorithm, (data: Uint8Array, size: number) => Promise<Uint8Array>>>>;
   readonly compress: Readonly<Partial<Record<CompressionAlgorithm, (data: Uint8Array) => Uint8Array>>>;
   hmac(key: Uint8Array, parts: readonly Uint8Array[]): Uint8Array;
   equal(a: Uint8Array, b: Uint8Array): boolean;
@@ -251,7 +265,7 @@ export function decodeWith(data: BinaryInput, options: DecodeOptions | undefined
     let out = callCodecSync(cfg.codecs, alg, 'decompress', [payload, size]);
     if (out === undefined) {
       const builtin = platform.decompress[alg];
-      if (builtin === undefined) throw unavailable(alg, 'decompression', webFormat(alg, 'DecompressionStream') !== undefined);
+      if (builtin === undefined) throw unavailable(alg, 'decompression', mayDecompressAsync(alg));
       out = builtin(payload, size);
     }
     bytes = checkSize(out, size, alg);
@@ -314,15 +328,31 @@ export async function decodeAsyncWith(
   if (env !== null) {
     const { alg, payload, size } = env;
     let out = await callCodecAsync(cfg.codecs, alg, 'decompress', [payload, size]);
-    if (out === undefined) {
-      const format = webFormat(alg, 'DecompressionStream');
-      const builtin = platform.decompress[alg];
-      if (format !== undefined) out = await webDecompress(alg, format, payload, size);
-      else if (builtin !== undefined) out = builtin(payload, size);
-      else throw unavailable(alg, 'decompression', false);
-    }
+    if (out === undefined) out = await decompressAsync(platform, alg, payload, size);
     bytes = checkSize(out, size, alg);
   }
   return decodeDocument(bytes, cfg);
+}
+
+/**
+ * decodeAsync's decompressor. It reaches the same verdict as decode's: first the same
+ * decompressor, in its non-blocking form where there is one (node:zlib), then the synchronous
+ * one (the pure-JS inflate). A DecompressionStream is the last resort, only for a format that
+ * the runtime has shown it handles strictly, and never for zstd.
+ */
+async function decompressAsync(platform: Platform, alg: CompressionAlgorithm, payload: Uint8Array, size: number): Promise<Uint8Array> {
+  const nonBlocking = platform.decompressAsync?.[alg];
+  if (nonBlocking !== undefined) return nonBlocking(payload, size);
+  const builtin = platform.decompress[alg];
+  if (builtin !== undefined) return builtin(payload, size);
+  const format = await trustedDecompressionFormat(alg);
+  if (format !== undefined) return webDecompress(alg, format, payload, size);
+  if (mayDecompressAsync(alg)) {
+    throw fail(
+      'unsupported_compression',
+      `${alg} decompression is not available in this environment: its DecompressionStream accepts bytes after the end of a stream; pass options.codecs.${alg}`,
+    );
+  }
+  throw unavailable(alg, 'decompression', false);
 }
 

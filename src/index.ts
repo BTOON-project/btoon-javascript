@@ -72,10 +72,13 @@ export function encodeAsync(value: unknown, options?: EncodeOptions): Promise<Ui
 }
 
 /**
- * Like {@link decode}, but decompresses with `DecompressionStream` (when the runtime
- * supports the algorithm) and verifies signatures with `crypto.subtle.verify`, falling back
- * to the synchronous implementations. The input is copied first, so the caller may reuse
- * its buffer immediately. Rejects with a {@link BtoonError}.
+ * Like {@link decode}, but asynchronous. In the Node.js entry, decompression runs on the
+ * `node:zlib` thread pool. In the portable entry, zlib uses the same pure-JS inflate as
+ * `decode`, and Brotli can also be decompressed with a `DecompressionStream` where the runtime
+ * has shown that it rejects bytes after the end of a stream (never Zstandard, whose window
+ * size it can't bound). Signatures are verified with `crypto.subtle.verify` where available.
+ * `decodeAsync` never accepts a document that `decode` rejects. The input is copied first, so
+ * the caller may reuse its buffer immediately. Rejects with a {@link BtoonError}.
  */
 export function decodeAsync(data: BinaryInput, options?: DecodeOptions): Promise<unknown> {
   return decodeAsyncWith(data, options, portablePlatform);

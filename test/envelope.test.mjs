@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { createHmac, randomBytes } from 'node:crypto';
 import { describe, test } from 'node:test';
 import zlib from 'node:zlib';
-import { builds, hex } from './helpers.mjs';
+import { builds, compressedCases, hex, verdict } from './helpers.mjs';
 
 const node = builds['esm/node'];
 const portable = builds['esm/portable'];
@@ -220,6 +220,24 @@ describe('compression envelope', () => {
     }
   });
 
+  test('decodeAsync reaches the same verdict as decode on compressed payloads (SPEC §6)', async () => {
+    // With this runtime's own DecompressionStream; test/ds-lenient.test.mjs covers lax ones.
+    const small = node.encode({ msg: 'x'.repeat(300), n: [1, 2, 3] });
+    for (const [label, bytes] of compressedCases(small)) {
+      for (const [name, lib] of [['node', node], ['portable', portable]]) {
+        const sync = await verdict(() => lib.decode(bytes));
+        const async = await verdict(() => lib.decodeAsync(bytes));
+        if (sync.code === 'unsupported_compression' && async.code !== 'unsupported_compression') {
+          // A DecompressionStream may handle what the portable build's decode can't. Then it
+          // must reach the verdict of a decode that has the codec.
+          assert.deepEqual(async, await verdict(() => node.decode(bytes)), `${name}, ${label}`);
+          continue;
+        }
+        assert.deepEqual(async, sync, `${name}, ${label}: decode ${JSON.stringify(sync)}, decodeAsync ${JSON.stringify(async)}`);
+      }
+    }
+  });
+
   test('decompression bombs are capped while decompressing', async () => {
     const zeros = new Uint8Array(64 * 1024 * 1024);
     const bomb = zlib.deflateSync(zeros, { level: 9 });
@@ -270,6 +288,22 @@ describe('signed envelope', () => {
       await rejectsWith(() => decode(sealed, { hmacKey: 'wrong-key' }), 'authentication_failed');
       await rejectsWith(() => decode(node.encode(value), { hmacKey: key }), 'authentication_failed');
     }
+  });
+
+  test('an empty hmacKey is an error, not "no key" (SPEC §8)', async () => {
+    const sealed = node.encode(1, { hmacKey: key });
+    for (const empty of ['', new Uint8Array(0), Buffer.alloc(0)]) {
+      for (const lib of [node, portable]) {
+        await rejectsWith(() => lib.encode(1, { hmacKey: empty }), 'invalid_argument');
+        await rejectsWith(() => lib.encodeAsync(1, { hmacKey: empty }), 'invalid_argument');
+        for (const input of [sealed, lib.encode(1)]) {
+          await rejectsWith(() => lib.decode(input, { hmacKey: empty }), 'invalid_argument');
+          await rejectsWith(() => lib.decodeAsync(input, { hmacKey: empty }), 'invalid_argument');
+        }
+      }
+    }
+    // "No key" is an absent (undefined) hmacKey.
+    for (const lib of [node, portable]) assert.equal(lib.decode(lib.encode(1), { hmacKey: undefined }), 1);
   });
 
   test('long keys (> 64 bytes) and binary keys', async () => {
