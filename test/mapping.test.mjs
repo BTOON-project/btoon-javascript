@@ -22,7 +22,7 @@ for (const name of ['esm/node', 'esm/portable']) {
   describe(`${name}: constants and errors`, () => {
     test('VERSION and SPEC_VERSION', () => {
       assert.equal(lib.VERSION, pkg.version);
-      assert.equal(lib.SPEC_VERSION, '0.2');
+      assert.equal(lib.SPEC_VERSION, '0.3');
     });
     test('BtoonError shape', () => {
       try {
@@ -84,18 +84,29 @@ for (const name of ['esm/node', 'esm/portable']) {
         assert.equal(dec(enc(v)), v);
       }
     });
-    test("decoding: safe integers → number, beyond → bigint; bigint: 'always' for 64-bit markers", () => {
+    test("decoding: safe integers → number, beyond → bigint; bigint: 'always' beyond 32 bits", () => {
       assert.equal(dec('cf001fffffffffffff'), Number.MAX_SAFE_INTEGER);
       assert.equal(dec('cf0020000000000000'), 2n ** 53n);
       assert.equal(dec('d3ffe0000000000001'), Number.MIN_SAFE_INTEGER);
       assert.equal(dec('d3ffe0000000000000'), -(2n ** 53n));
       assert.equal(dec('cfffffffffffffffff'), 2n ** 64n - 1n);
       assert.equal(dec('d38000000000000000'), -(2n ** 63n));
-      assert.equal(dec('cf0000000000000005', { bigint: 'always' }), 5n);
-      assert.equal(dec('d3fffffffffffffffb', { bigint: 'always' }), -5n);
-      assert.equal(dec('ce00000005', { bigint: 'always' }), 5);
+      // 'always': a bigint for every integer outside [-2^31, 2^32-1], which a canonical
+      // encoder writes as uint64, int64 or a bigint extension, even a safe one.
+      assert.equal(dec('cf0000000100000000', { bigint: 'always' }), 2n ** 32n);
+      assert.equal(dec('d3ffffffff7fffffff', { bigint: 'always' }), -(2n ** 31n) - 1n);
+      assert.equal(dec('ceffffffff', { bigint: 'always' }), 2 ** 32 - 1);
+      assert.equal(dec('d280000000', { bigint: 'always' }), -(2 ** 31));
+      assert.equal(dec('05', { bigint: 'always' }), 5);
+      assert.equal(dec('c705fc0100000000', { bigint: 'always' }), 2n ** 32n);
+      // The type depends on the value, never on how it was encoded (SPEC §7): non-canonical
+      // 64-bit forms and bigint extensions of the same integers decode the same way.
+      assert.equal(dec('cf0000000000000005', { bigint: 'always' }), 5);
+      assert.equal(dec('d3fffffffffffffffb', { bigint: 'always' }), -5);
+      assert.equal(dec('cf00000000ffffffff', { bigint: 'always' }), 2 ** 32 - 1);
+      assert.equal(dec('d3ffffffff80000000', { bigint: 'always' }), -(2 ** 31));
       assert.equal(dec('c701fc05'), 5, 'a small bigint extension is the same logical integer');
-      assert.equal(dec('c701fc05', { bigint: 'always' }), 5n);
+      assert.equal(dec('c701fc05', { bigint: 'always' }), 5);
       assert.equal(dec('c703fcffff80'), -128);
     });
   });
@@ -314,7 +325,9 @@ for (const name of ['esm/node', 'esm/portable']) {
         throwsCode(() => encode({ k: bad }), 'invalid_argument');
         throwsCode(() => encode(new Map([['k', bad]])), 'invalid_argument');
       }
-      throwsCode(() => encode({ toJSON() {} }), 'invalid_argument'); // a plain object's function property
+      // A plain object's own toJSON() is called, as JSON.stringify does (review 2026-11-13).
+      assert.equal(enc({ toJSON() {} }), 'c0');
+      assert.equal(enc({ toJSON: 5 }), enc(new Map([['toJSON', 5]])), 'not a function: an ordinary property');
       // toJSON() is called once per value: a result with its own toJSON() is encoded by its
       // own properties, so toJSON() returning `this` terminates.
       class Nested {
@@ -452,12 +465,18 @@ for (const name of ['esm/node', 'esm/portable']) {
       assert.equal(dec('d7feffffffffffffffff').getTime(), -1);
       assert.equal(dec('d7fdffffffffffffffff').getTime(), -1, 'floor of -1 ns');
       const dt = dec('d7fd17979cfe3d85cd15', { timestamps: 'object' });
+      assert.ok(dt instanceof lib.BtoonDateTime && dt instanceof Timestamp);
+      assert.equal(dt.epochNanoseconds, 1700000000123456789n);
       assert.equal(dt.seconds, 1700000000n);
       assert.equal(dt.nanoseconds, 123456789);
       const d = dec('d7feffffffffffffffff', { timestamps: 'object' });
+      assert.ok(d instanceof lib.BtoonDate && d instanceof Timestamp);
+      assert.equal(d.epochMilliseconds, -1n);
       assert.equal(d.seconds, -1n);
       assert.equal(d.nanoseconds, 999000000);
-      assert.ok(dec('d7fe7fffffffffffffff') instanceof Timestamp, 'beyond Date range');
+      const far = dec('d7fe7fffffffffffffff');
+      assert.ok(far instanceof lib.BtoonDate, 'beyond Date range: a BtoonDate');
+      assert.equal(far.epochMilliseconds, 2n ** 63n - 1n);
     });
     test('Timestamp validation and conversions', () => {
       throwsCode(() => new Timestamp(0n, 1e9), 'invalid_argument');
@@ -567,6 +586,7 @@ for (const name of ['esm/node', 'esm/portable']) {
       }
       assert.equal(dec('c0', { maxValues: Number.MAX_SAFE_INTEGER }), null);
       throwsCode(() => encode(1, { compression: 'gzip' }), 'invalid_argument');
+      throwsCode(() => encode(1, { compression: 'auto' }), 'invalid_argument'); // the native package's deprecated alias
       throwsCode(() => encode(1, { autoTabular: 'yes' }), 'invalid_argument');
       throwsCode(() => encode(1, { hmacKey: '' }), 'invalid_argument');
       throwsCode(() => encode(1, { hmacKey: new Uint8Array(0) }), 'invalid_argument');
@@ -609,7 +629,8 @@ test('CommonJS builds expose the same API', () => {
     assert.equal(hex(lib.encode({ a: [1, 2n ** 70n, new Date(0)] })), hex(esm.encode({ a: [1, 2n ** 70n, new Date(0)] })));
   }
   assert.deepEqual(Object.keys(builds['esm/node']).sort(), [
-    'BtoonError', 'Ext', 'SPEC_VERSION', 'Timestamp', 'VERSION', 'decode', 'decodeAsync', 'encode', 'encodeAsync',
+    'BtoonDate', 'BtoonDateTime', 'BtoonError', 'Ext', 'SPEC_VERSION', 'Timestamp', 'VERSION', 'decode', 'decodeAsync',
+    'encode', 'encodeAsync',
   ]);
 });
 

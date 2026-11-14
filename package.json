@@ -1,6 +1,6 @@
 {
   "name": "@btoon/js",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "BTOON (Binary TOON) for JavaScript and TypeScript: canonical, hardened MessagePack with a columnar encoding for tables. Pure TypeScript, zero dependencies; runs in browsers, Node.js, Deno, Bun and edge runtimes.",
   "keywords": [
     "btoon",

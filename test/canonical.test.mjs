@@ -26,7 +26,7 @@ function genKey(r) {
 }
 
 function genScalar(r, lib) {
-  switch (r.int(16)) {
+  switch (r.int(18)) {
     case 0:
       return null;
     case 1:
@@ -62,6 +62,14 @@ function genScalar(r, lib) {
       return new lib.Ext(r.pick([0, 1, 42, 127, -7, -100, -128]), Uint8Array.from({ length: r.pick([0, 1, 2, 3, 4, 8, 16, 17, 300]) }, () => r.int(256)));
     case 14:
       return undefined;
+    case 15: {
+      const ms = BigInt(Math.floor((r.next() - 0.5) * 2 ** r.int(54)));
+      return new lib.BtoonDate(r.bool(0.05) ? r.pick([-(2n ** 63n), 2n ** 63n - 1n]) : ms);
+    }
+    case 16: {
+      const ns = BigInt(Math.floor((r.next() - 0.5) * 2 ** r.int(43))) * BigInt(r.pick([1, 1000, 1000003]));
+      return new lib.BtoonDateTime(r.bool(0.05) ? r.pick([-(2n ** 63n), 2n ** 63n - 1n]) : ns);
+    }
     default:
       return r.pick(['', 'a', 0, 1, 255, 65536, -1]);
   }

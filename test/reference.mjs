@@ -151,6 +151,8 @@ export function refEncode(v, opts = {}) {
     }
     return timestamp(s, Number(r) * 1e6);
   }
+  if (v.constructor?.name === 'BtoonDate') return ext(-2, Uint8Array.from(twos(8, v.epochMilliseconds)));
+  if (v.constructor?.name === 'BtoonDateTime') return ext(-3, Uint8Array.from(twos(8, v.epochNanoseconds)));
   if (v.constructor?.name === 'Timestamp') return timestamp(v.seconds, v.nanoseconds, v.offsetMinutes);
   if (v.constructor?.name === 'Ext') {
     if ((v.type <= -1 && v.type >= -6) || v.type === -10) throw new Error(`reference encoder: Ext(${v.type}) is not writable (§5.7)`);

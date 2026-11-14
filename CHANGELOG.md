@@ -1,5 +1,77 @@
 # Changelog
 
+## 0.3.0 (2026-11-14): BTOON spec 0.3
+
+Implements [spec 0.3](https://github.com/BTOON-project/btoon-core/blob/main/docs/SPEC.md).
+The wire format is unchanged. `SPEC_VERSION` is now `'0.3'`, and every
+BTOON type round-trips: @btoon/js can now write dates and datetimes. This release also fixes
+the remaining @btoon/js findings of the 2026-11-13 review, and its behavior matches the
+native `btoon` package 0.3.0 exactly. Behavior changes are marked.
+
+- **New: `BtoonDate` and `BtoonDateTime`**, typed values for the date (-2) and datetime (-3)
+  extensions. Both subclass `Timestamp` and hold the exact value on the wire,
+  `epochMilliseconds` or `epochNanoseconds`, a `bigint` in the int64 range; the inherited
+  `seconds` and `nanoseconds` describe the same instant, floored, and `offsetMinutes` is
+  `undefined`. The constructors take a `bigint` or a safe-integer `number`. `fromDate(date)`,
+  `fromTimestamp(ts)` and the inherited `toDate()` convert: a date floors to the
+  millisecond, and a `Timestamp` with a UTC offset or out of range is `invalid_argument`.
+  `encode` writes them as `fixext 8` with a big-endian `i64`, table cells included. A `Date`
+  still encodes as a timestamp (-1). A raw `Ext(-2)` or `Ext(-3)` is still refused, now
+  with a message that names these types.
+- **Behavior change:** with `timestamps: 'object'`, a date decodes to a `BtoonDate` and a
+  datetime to a `BtoonDateTime`, not a plain `Timestamp`, so a decoded document encodes
+  back to the same bytes. Code that checks `instanceof Timestamp` or reads
+  `seconds`/`nanoseconds` keeps working. With the default `'date'`, a date outside the
+  range of `Date` decodes to a `BtoonDate` instead of a `Timestamp`. Everything else still
+  decodes to a `Date`.
+- **Fixed:** input in a `SharedArrayBuffer` failed to decode in browsers, as `invalid_utf8`
+  (or `size_limit` with `strict: false`): their `TextDecoder` refuses views of shared
+  memory. `decode` now copies shared input once before reading it, as it already did with
+  `hmacKey`.
+- **Fixed:** a plain object (an object literal or `Object.create(null)`) with its own
+  `toJSON()` threw `invalid_argument` ("cannot encode a function"), where `JSON.stringify`
+  and the native package call it. **Behavior change:** it now encodes as what its `toJSON()`
+  returns, called once, as rows and cells of tables too. An inherited `toJSON`, such as a
+  polluted `Object.prototype.toJSON`, is still ignored for plain objects.
+- **Fixed:** `instanceof Timestamp`, `Ext` and `BtoonError` were false for values from the
+  other build (CommonJS or ESM) or another copy of the package, though the encoder accepted
+  them. `instanceof` now checks their brands (`Symbol.hasInstance`), and so do `BtoonDate`
+  and `BtoonDateTime`. `BtoonError` has a brand now too. Subclasses you write keep the
+  ordinary `instanceof`.
+- **Fixed:** a getter that changed the rows of a table while it was written (emptying the
+  array, or replacing or removing a row) made `encode` throw a raw `TypeError`. The table is
+  now written from the rows as they were when it was planned; each cell is still read as it
+  is written.
+- **Changed:** `new Timestamp(seconds)` defaults `nanoseconds` to 0, as the native package
+  does. It was required.
+- **Behavior change:** `bigint: 'always'` depends on the value only. Every integer outside
+  [-2^31, 2^32-1] decodes to a `bigint`, which is what a canonical encoder writes with a
+  64-bit marker or as a bigint extension. It used to depend on the encoding: a non-canonical
+  `cf 0000000000000005`, or a bigint extension holding 5, gave `5n` while `05` gave `5`,
+  although SPEC §7 asks for the same value whatever the encoding. Canonical input decodes as
+  before. The native `btoon` package 0.3.0 follows the same rule, which is a behavior change
+  there: it gave a `bigint` for every integer, so `decode(encode(5), { bigint: 'always' })` is
+  now `5`, not `5n`.
+- **New:** a Proxy of a `Map`, such as Vue's and MobX's reactive Maps, encodes like its
+  target, read through the proxy's own `keys()` and `get()`. It threw a `TypeError` before,
+  as a bare Proxy of a Map still does. One whose `keys()` repeats a key throws
+  `invalid_argument`. Maps themselves, subclasses included, are still read with the
+  intrinsic `Map` methods, so an overridden iterator can't repeat a key.
+- **Fixed:** a Proxy of an array whose `length` isn't an integer in [0, 2^32-1] wrote a
+  malformed array. It now throws `invalid_argument`.
+- `Timestamp.fromDate(invalidDate)` says "cannot convert an invalid Date" (the code is still
+  `invalid_argument`).
+- **Docs:** the README covers the typed date values, `instanceof` across copies, shared
+  memory, `bigint: 'always'`, and what a custom `decompress` must reject (bytes after the
+  stream, and LZ4 blocks that break the end-of-block conditions, SPEC §6).
+- **Tests:** the conformance harness runs the 311 spec 0.3 vectors. It re-encodes the date
+  and datetime vectors from `BtoonDate` and `BtoonDateTime`, and checks that every canonical
+  vector decoded with `timestamps: 'object'` encodes back to its bytes. Only `float/0` still
+  skips its re-encoding. The `lz4-block/*` vectors are skipped, as @btoon/js has no LZ4 of
+  its own. New regression tests cover each fix above, shared input runs against a
+  `TextDecoder` that refuses shared views as browsers' does, and `test/parity-cases.cjs`
+  holds API cases that the native package runs too, with the same expected results.
+
 ## 0.2.0 (2026-11-14): BTOON spec 0.2
 
 Implements [spec 0.2](https://github.com/BTOON-project/btoon-core/blob/main/docs/SPEC.md)
