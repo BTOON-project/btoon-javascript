@@ -17,7 +17,7 @@ export { SPEC_VERSION, VERSION } from './constants.js';
 export type { BinaryInput } from './core.js';
 export { BtoonError, type BtoonErrorCode } from './errors.js';
 export type { Codec, CodecRegistry, CompressionAlgorithm, DecodeOptions, EncodeOptions } from './options.js';
-export { Ext, Timestamp } from './values.js';
+export { BtoonDate, BtoonDateTime, Ext, Timestamp } from './values.js';
 
 /**
  * Encodes a value as canonical BTOON (SPEC §4): identical values produce identical bytes
@@ -28,12 +28,13 @@ export { Ext, Timestamp } from './values.js';
  * `bigint`, strings (must not contain lone surrogates), `Uint8Array`/`ArrayBuffer`/other
  * typed arrays and `DataView` (binary), `Float32Array`/`Float64Array` (float vectors),
  * arrays, plain objects and `Map`s with string keys (maps, keys sorted by UTF-8 bytes),
- * `Date` and {@link Timestamp} (timestamps), and {@link Ext} (except for the ids BTOON
- * defines, SPEC §5.7). Any other object is encoded the way `JSON.stringify` sees it: the
- * result of its `toJSON()` method if it has one (called once), otherwise a map of its own
+ * `Date` and {@link Timestamp} (timestamps), {@link BtoonDate} (dates), {@link BtoonDateTime}
+ * (datetimes), and {@link Ext} (except for the ids BTOON defines, SPEC §5.7). Any other
+ * object is encoded the way `JSON.stringify` sees it: the result of its `toJSON()` method if
+ * it has one (called once; for a plain object, an own `toJSON`), otherwise a map of its own
  * enumerable string-keyed properties; `Number`, `String`, `Boolean` and `BigInt` wrapper
- * objects are unwrapped. Functions and symbols are rejected. Arrays of uniform objects use
- * the tabular encoding when it is smaller.
+ * objects are unwrapped. Proxies encode like their targets. Functions and symbols are
+ * rejected. Arrays of uniform objects use the tabular encoding when it is smaller.
  *
  * With `compress` or `hmacKey`, the document is wrapped in a compression and/or signed
  * envelope, layered as sign(compress(document)).
@@ -56,7 +57,8 @@ export function encode(value: unknown, options?: EncodeOptions): Uint8Array<Arra
  * with `hmacKey` the signature is verified before anything is parsed.
  *
  * Maps decode to plain objects. A `"__proto__"` key becomes an own property (as with
- * `JSON.parse`); it never changes an object's prototype.
+ * `JSON.parse`); it never changes an object's prototype. Input in shared memory (a
+ * `SharedArrayBuffer`) is copied once first.
  *
  * @throws {BtoonError} with the SPEC §7 error code describing the problem.
  */

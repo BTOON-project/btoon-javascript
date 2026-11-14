@@ -1,3 +1,5 @@
+import { ERROR_BRAND } from './constants.js';
+
 /**
  * Machine-readable error codes. All but `invalid_argument` are the decoder error codes
  * of SPEC §7; `invalid_argument` reports a value or option the library cannot accept.
@@ -43,6 +45,10 @@ export type BtoonErrorCode =
  * The only error type thrown by this library's `encode`/`decode` functions (and the only
  * rejection reason of the async variants). Branch on {@link BtoonError.code}, which is
  * stable across BTOON implementations; the message is for humans and may change.
+ *
+ * `instanceof BtoonError` holds for errors from every copy of this library (the CommonJS and
+ * ESM builds, a bundled duplicate, another realm) and from the native `btoon` package: it
+ * checks a brand, not the prototype chain. A subclass keeps the ordinary `instanceof`.
  */
 export class BtoonError extends Error {
   /** Machine-readable error code (SPEC §7, plus `invalid_argument`). */
@@ -61,6 +67,16 @@ export class BtoonError extends Error {
       });
     }
   }
+
+  static override [Symbol.hasInstance](value: unknown): value is BtoonError {
+    return this === BtoonError ? isBtoonError(value) : Function.prototype[Symbol.hasInstance].call(this, value);
+  }
+}
+Object.defineProperty(BtoonError.prototype, ERROR_BRAND, { value: true });
+
+/** True for a {@link BtoonError} from any copy of this library or the native package. */
+export function isBtoonError(v: unknown): v is BtoonError {
+  return typeof v === 'object' && v !== null && (v as { [ERROR_BRAND]?: unknown })[ERROR_BRAND] === true;
 }
 
 /** Shorthand used internally: `throw fail('truncated', '...')`. */
@@ -75,7 +91,7 @@ export function fail(code: BtoonErrorCode, message: string, cause?: unknown): Bt
  * that case is reported as `max_depth` instead of leaking a RangeError.
  */
 export function isStackOverflow(e: unknown): boolean {
-  if (e instanceof BtoonError) return false;
+  if (isBtoonError(e)) return false;
   if (typeof e !== 'object' || e === null) return false;
   const err = e as { name?: unknown; message?: unknown };
   if (err.name !== 'RangeError' && err.name !== 'InternalError') return false;

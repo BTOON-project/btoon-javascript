@@ -28,6 +28,8 @@ export interface Codec {
    * Decompress a payload. `uncompressedSize` is the size declared by the envelope, already
    * checked against `maxDecompressedSize`; implementations must not produce more than that
    * (LZ4 block decoders need it as the output size). The result must be exactly that long.
+   * The payload must end exactly where the compressed stream does, and an LZ4 block must meet
+   * the block format's end-of-block conditions (SPEC §6): throw for anything else.
    */
   decompress?(data: Uint8Array, uncompressedSize: number): Uint8Array | Promise<Uint8Array>;
 }
@@ -98,15 +100,19 @@ export interface DecodeOptions {
    */
   hmacKey?: Uint8Array | string;
   /**
-   * How timestamp (-1), date (-2) and datetime (-3) values decode. `'date'` (default):
-   * `Date` (millisecond precision, offset dropped; instants outside the range of `Date`
-   * become `Timestamp`). `'object'`: always {@link Timestamp}, with full precision.
+   * How timestamp (-1), date (-2) and datetime (-3) values decode. `'date'` (default): a
+   * `Date` (millisecond precision, offset dropped); an instant outside the range of `Date`
+   * becomes a `Timestamp`, or a `BtoonDate` for a date. `'object'`: lossless, so that the
+   * same bytes encode back: a `Timestamp` for a timestamp, a `BtoonDate` for a date and a
+   * `BtoonDateTime` for a datetime (both subclasses of `Timestamp`).
    */
   timestamps?: 'date' | 'object';
   /**
-   * `'auto'` (default): integers decode to `number` when they are safe integers and to
-   * `bigint` otherwise. `'always'`: integers written with a 64-bit marker (uint64/int64)
-   * or as a bigint extension always decode to `bigint`.
+   * Which integers decode to `bigint`; the rest are numbers. The type depends on the value,
+   * never on how the input encoded it (SPEC §7).
+   * - `'auto'` (default): every integer outside the safe range [-(2^53-1), 2^53-1].
+   * - `'always'`: every integer outside [-2^31, 2^32-1], even a safe one: what a canonical
+   *   encoder writes as uint64, int64 or a bigint extension.
    */
   bigint?: 'auto' | 'always';
   /** Caller-supplied compression codecs. */

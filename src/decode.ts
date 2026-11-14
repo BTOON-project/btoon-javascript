@@ -21,11 +21,13 @@ import {
 import { BtoonError, fail, isStackOverflow, type BtoonErrorCode } from './errors.js';
 import type { DecodeConfig } from './options.js';
 import { decodeUtf8 } from './utf8.js';
-import { Ext, Timestamp } from './values.js';
+import { BtoonDate, BtoonDateTime, Ext, Timestamp } from './values.js';
 
 const TWO_32 = 4294967296;
 const LITTLE_ENDIAN = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
 const MAX_DATE_SECONDS = MAX_DATE_MS / 1000;
+const MAX_DATE_MS_BIG = BigInt(MAX_DATE_MS);
+const MAX_SAFE_BIG = BigInt(Number.MAX_SAFE_INTEGER);
 const hasOwn = Object.prototype.hasOwnProperty;
 const fromCharCode = String.fromCharCode;
 
@@ -227,12 +229,17 @@ class Decoder {
     }
   }
 
+  // An integer's JavaScript type depends on its value, never on how it was encoded (SPEC §7):
+  // 'auto' gives a number for a safe integer, 'always' for one in the 32-bit range
+  // [-2^31, 2^32-1], which is exactly what a canonical encoder writes without a 64-bit marker.
+  // Everything else is a bigint.
+
   private uint64(): number | bigint {
     this.need(8);
     const p = this.pos;
     this.pos += 8;
     const hi = this.view.getUint32(p);
-    if (!this.bigAlways && hi < 0x200000) return hi * TWO_32 + this.view.getUint32(p + 4);
+    if (hi < (this.bigAlways ? 1 : 0x200000)) return hi * TWO_32 + this.view.getUint32(p + 4);
     return this.view.getBigUint64(p);
   }
 
@@ -240,11 +247,9 @@ class Decoder {
     this.need(8);
     const p = this.pos;
     this.pos += 8;
-    if (!this.bigAlways) {
-      // Exact whenever the result is a safe integer; never safe-looking when it isn't.
-      const v = this.view.getInt32(p) * TWO_32 + this.view.getUint32(p + 4);
-      if (Number.isSafeInteger(v)) return v;
-    }
+    // Exact whenever the result is a safe integer; never safe-looking when it isn't.
+    const v = this.view.getInt32(p) * TWO_32 + this.view.getUint32(p + 4);
+    if (this.bigAlways ? v >= -0x80000000 && v <= 0xffffffff : Number.isSafeInteger(v)) return v;
     return this.view.getBigInt64(p);
   }
 
@@ -417,18 +422,18 @@ class Decoder {
         return this.instant(sec, ns, off);
       }
       case EXT_DATE: {
+        // A BtoonDate keeps the type (SPEC §10); a Date when asked for, if it can hold it.
         if (len !== 8) throw bad('invalid date length');
         const ms = view.getBigInt64(start);
-        if (!this.tsObjects && ms <= BigInt(MAX_DATE_MS) && ms >= -BigInt(MAX_DATE_MS)) return new Date(Number(ms));
-        const [s, r] = floorDiv(ms, 1000n);
-        return new Timestamp(s, Number(r) * 1e6);
+        if (!this.tsObjects && ms <= MAX_DATE_MS_BIG && ms >= -MAX_DATE_MS_BIG) return new Date(Number(ms));
+        return new BtoonDate(ms);
       }
       case EXT_DATETIME: {
+        // Every datetime (±2^63 ns, about ±292 years) is within the range of Date.
         if (len !== 8) throw bad('invalid datetime length');
         const ns = view.getBigInt64(start);
         if (!this.tsObjects) return new Date(Number(floorDiv(ns, 1000000n)[0]));
-        const [s, r] = floorDiv(ns, 1000000000n);
-        return new Timestamp(s, Number(r));
+        return new BtoonDateTime(ns);
       }
       case EXT_BIGINT:
         if (len === 0) throw bad('empty bigint');
@@ -453,7 +458,7 @@ class Decoder {
     }
   }
 
-  /** A timestamp as a Date (default) or a Timestamp (`timestamps: 'object'`, or out of Date range). */
+  /** A timestamp as a Date (default) or a Timestamp (`timestamps: 'object'`, or outside the range of Date). */
   private instant(sec: number | bigint, ns: number, off: number | undefined): Date | Timestamp {
     if (!this.tsObjects) {
       const s = typeof sec === 'number' ? sec : sec <= BigInt(MAX_DATE_SECONDS) && sec >= -BigInt(MAX_DATE_SECONDS) ? Number(sec) : NaN;
@@ -480,7 +485,7 @@ class Decoder {
     } catch (e) {
       throw fail('size_limit', `bigint too large for this JavaScript engine (at byte ${start})`, e);
     }
-    if (!this.bigAlways && v >= -0x1fffffffffffffn && v <= 0x1fffffffffffffn) return Number(v);
+    if (this.bigAlways ? v >= -0x80000000n && v <= 0xffffffffn : v >= -MAX_SAFE_BIG && v <= MAX_SAFE_BIG) return Number(v);
     return v;
   }
 

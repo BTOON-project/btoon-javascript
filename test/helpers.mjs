@@ -127,9 +127,8 @@ function one(typed) {
 }
 
 /**
- * Builds the JavaScript value whose canonical encoding is the vector. `date` and `datetime`
- * have no JavaScript value at all: `Date` encodes as a timestamp, and SPEC §5.7 forbids
- * writing their extension ids raw (see `reencodable`).
+ * Builds the JavaScript value whose canonical encoding is the vector: `date` and `datetime`
+ * are the typed values BtoonDate and BtoonDateTime (SPEC §10).
  */
 export function fromTyped(typed, lib) {
   const [kind, x] = one(typed);
@@ -160,8 +159,9 @@ export function fromTyped(typed, lib) {
     case 'timestamp':
       return new lib.Timestamp(BigInt(x.seconds), x.nanoseconds, x.offset_minutes);
     case 'date':
+      return new lib.BtoonDate(BigInt(x));
     case 'datetime':
-      throw new Error(`${kind} has no JavaScript value that encodes to it`);
+      return new lib.BtoonDateTime(BigInt(x));
     case 'float32_vector':
     case 'float64_vector':
       return vectorOf(kind, x);
@@ -173,12 +173,10 @@ export function fromTyped(typed, lib) {
 }
 
 /**
- * False if the value has a part JavaScript has no native type for, so the vector may skip
- * its re-encoding (SPEC §10):
- * - a float that JavaScript can't distinguish from an integer (such as 0.0), which encodes
- *   as an integer;
- * - a date (-2) or datetime (-3): JavaScript has no such types (a `Date` is a timestamp,
- *   -1), and SPEC §5.7 forbids writing their ids as a raw `Ext`.
+ * False if the value has a part JavaScript can't represent distinctly, so the vector may skip
+ * its re-encoding (SPEC §10): a float that JavaScript can't tell from an integer (such as
+ * 0.0), which encodes as an integer. Everything else, date and datetime included, must
+ * re-encode.
  */
 export function reencodable(typed) {
   const [kind, x] = one(typed);
@@ -186,7 +184,6 @@ export function reencodable(typed) {
     const f = parseFloatTyped(x);
     return !(Number.isSafeInteger(f) && !Object.is(f, -0));
   }
-  if (kind === 'date' || kind === 'datetime') return false;
   if (kind === 'array') return x.every(reencodable);
   if (kind === 'map') return Object.values(x).every(reencodable);
   return true;
@@ -206,10 +203,15 @@ function sameFloat(a, b) {
   return Number.isNaN(a) ? Number.isNaN(b) : Object.is(a, b);
 }
 
+const INT32_MIN = -(2n ** 31n);
+const UINT32_MAX = 2n ** 32n - 1n;
+const SAFE = BigInt(Number.MAX_SAFE_INTEGER);
+
 /**
- * Semantic comparison against a typed value: NaN equals NaN, -0 differs from 0, integers
- * compare by value across number and bigint, maps ignore order. `opts.timestamps` is the
- * decode mode used. Returns null on a match, or a description of the first difference.
+ * Semantic comparison against a typed value: NaN equals NaN, -0 differs from 0, an integer is
+ * a number or a bigint as `opts.bigint` says (by its value), maps ignore order. Instants are
+ * Dates, or with `opts.timestamps: 'object'` instances of exactly Timestamp, BtoonDate or
+ * BtoonDateTime. Returns null on a match, or a description of the first difference.
  */
 export function mismatch(actual, typed, lib, opts, path = '$') {
   const [kind, x] = one(typed);
@@ -222,11 +224,10 @@ export function mismatch(actual, typed, lib, opts, path = '$') {
       return actual === x ? null : bad();
     case 'int': {
       if (typeof actual !== 'bigint' && !(typeof actual === 'number' && Number.isInteger(actual))) return bad();
-      if (BigInt(actual) !== BigInt(x)) return bad();
-      if (opts.bigint !== 'always') {
-        const safe = Number.isSafeInteger(Number(x)) && BigInt(Number(x)) === BigInt(x);
-        if (typeof actual !== (safe ? 'number' : 'bigint')) return bad(`${typeof actual} ${show(actual)}`);
-      }
+      const want = BigInt(x);
+      if (BigInt(actual) !== want) return bad();
+      const asNumber = opts.bigint === 'always' ? want >= INT32_MIN && want <= UINT32_MAX : want >= -SAFE && want <= SAFE;
+      if (typeof actual !== (asNumber ? 'number' : 'bigint')) return bad(`${typeof actual} ${show(actual)}`);
       return null;
     }
     case 'float':
@@ -276,14 +277,22 @@ export function mismatch(actual, typed, lib, opts, path = '$') {
         nanos = Number(r);
       }
       const ms = seconds * 1000n + BigInt(Math.floor(nanos / 1e6));
-      // Instants outside the range of Date decode to Timestamp objects in every mode.
+      // Instants outside the range of Date decode to typed objects in every mode.
       if (tsObjects || ms > 8640000000000000n || ms < -8640000000000000n) {
-        return actual instanceof lib.Timestamp &&
+        const [Class, epoch] =
+          kind === 'date' ? [lib.BtoonDate, 'epochMilliseconds'] : kind === 'datetime' ? [lib.BtoonDateTime, 'epochNanoseconds'] : [lib.Timestamp];
+        const describe = () =>
+          typeof actual === 'object' && actual !== null
+            ? `${actual.constructor?.name}(${actual.seconds}, ${actual.nanoseconds}, ${actual.offsetMinutes}${epoch ? `, ${actual[epoch]}` : ''})`
+            : undefined;
+        return actual instanceof Class &&
+          Object.getPrototypeOf(actual) === Class.prototype &&
           actual.seconds === seconds &&
           actual.nanoseconds === nanos &&
-          actual.offsetMinutes === offset
+          actual.offsetMinutes === offset &&
+          (epoch === undefined || actual[epoch] === BigInt(x))
           ? null
-          : bad(actual instanceof lib.Timestamp ? `Timestamp(${actual.seconds}, ${actual.nanoseconds}, ${actual.offsetMinutes})` : undefined);
+          : bad(describe());
       }
       return actual instanceof Date && actual.getTime() === Number(ms) ? null : bad();
     }

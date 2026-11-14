@@ -9,8 +9,9 @@ compression envelope and an optional HMAC-signed envelope.
 - **Pure TypeScript, zero runtime dependencies.** Runs in browsers, Node.js ≥ 18, Deno,
   Bun and edge runtimes (Cloudflare Workers, Vercel Edge). ESM and CommonJS builds with
   type definitions.
-- **Conforming.** Implements [BTOON spec 0.2](https://github.com/BTOON-project/btoon-core/blob/main/docs/SPEC.md)
-  and passes all 298 conformance vectors of btoon-core (see [Conformance](#conformance)).
+- **Conforming.** Implements [BTOON spec 0.3](https://github.com/BTOON-project/btoon-core/blob/main/docs/SPEC.md)
+  and passes all 311 conformance vectors of btoon-core (see [Conformance](#conformance)).
+  Every BTOON type round-trips, dates and datetimes included.
 - **Canonical.** The same value encodes to the same bytes as in every other conforming
   implementation (C++, Python, Go, PHP), so encodings can be hashed, cached and signed.
 - **Hardened decoder.** Bounds-checked reads, a nesting limit, no allocation larger than
@@ -18,7 +19,7 @@ compression envelope and an optional HMAC-signed envelope.
   duplicate-key rejection, capped decompression, and signatures verified before anything
   is parsed (see [Limits](#limits)).
 
-Implements spec 0.2. In Node.js it is also the fastest BTOON package: on
+Implements spec 0.3. In Node.js it is also the fastest BTOON package: on
 10,000 records it encodes in 1.1 ms and decodes in 1.6 ms, against 7.8 ms and 7.1 ms for
 the native [`btoon`](https://github.com/BTOON-project/btoon-nodejs) addon, with
 byte-identical output.
@@ -132,7 +133,9 @@ const bytes = encode(value, { compress: true, codecs });
 A codec is `{ compress?(data), decompress?(data, uncompressedSize) }`. Either function may
 return a `Promise`, but only the async API accepts one. `decompress` receives the size the
 envelope declares (already checked against `maxDecompressedSize`) and must not produce
-more than that. LZ4 block decoders need it as their output size.
+more than that. LZ4 block decoders need it as their output size. A `decompress` must also
+throw for a payload with bytes after the end of its stream, and an LZ4 one for a block that
+breaks the block format's end-of-block conditions (SPEC §6), as liblz4 does.
 
 ## Type mapping
 
@@ -152,8 +155,11 @@ Encoding (JavaScript → BTOON):
 | plain object, `Map` with string keys | map, keys sorted by UTF-8 bytes |
 | `Date` | timestamp (millisecond precision, UTC) |
 | `Timestamp` | timestamp (nanoseconds, optional UTC offset) |
+| `BtoonDate` | date: `i64` milliseconds since the epoch |
+| `BtoonDateTime` | datetime: `i64` nanoseconds since the epoch |
 | `Ext` | extension, written as is. An id BTOON defines (-1…-6, -10) throws `invalid_argument` (SPEC §5.7) |
-| other objects | like `JSON.stringify`: the result of `toJSON()` if present (called once), else the object's own enumerable string-keyed properties. `Number`/`String`/`Boolean`/`BigInt` wrappers are unwrapped |
+| other objects | like `JSON.stringify`: the result of `toJSON()` if present (called once; for a plain object, only its own `toJSON`), else the object's own enumerable string-keyed properties. `Number`/`String`/`Boolean`/`BigInt` wrappers are unwrapped |
+| a `Proxy` | like its target. Proxied `Map`s (Vue's and MobX's reactive state) are read through their own `keys()` and `get()` |
 | functions, symbols | `invalid_argument` |
 
 Decoding (BTOON → JavaScript):
@@ -161,13 +167,15 @@ Decoding (BTOON → JavaScript):
 | BTOON | JavaScript |
 |---|---|
 | nil | `null` |
-| integer | `number` if a safe integer, else `bigint`. With `bigint: 'always'`, uint64/int64 markers and bigint extensions always give `bigint` |
+| integer | `number` for a safe integer, in [-(2^53-1), 2^53-1]; `bigint` outside it. With `bigint: 'always'`, `number` only in [-2^31, 2^32-1] and `bigint` for every integer outside it, even a safe one: what a canonical encoder writes as uint64, int64 or a bigint extension. The type depends on the value, never on its encoding |
 | float | `number` |
 | string | `string` |
 | binary | `Uint8Array` (a copy, never a view of the input) |
 | array, tabular | `Array` |
 | map | plain object |
-| timestamp, date, datetime | `Date` (milliseconds, offset dropped), or `Timestamp` with `timestamps: 'object'`. Instants outside the range of `Date` always give `Timestamp` |
+| timestamp | `Date` (milliseconds, offset dropped), or `Timestamp` with `timestamps: 'object'`. An instant outside the range of `Date` always gives a `Timestamp` |
+| date | `Date`, or `BtoonDate` with `timestamps: 'object'`. A date outside the range of `Date` always gives a `BtoonDate` |
+| datetime | `Date` (floored to the millisecond), or `BtoonDateTime` with `timestamps: 'object'` |
 | float32 / float64 vector | `Float32Array` / `Float64Array` (an aligned copy) |
 | any other extension | `Ext` |
 
@@ -179,9 +187,24 @@ Notes:
   as with `JSON.parse`. It never changes the object's prototype.
 - **Key order.** Keys are sorted by their UTF-8 bytes, which is not JavaScript's default
   `sort()` order for characters outside the Basic Multilingual Plane.
-- **`date` and `datetime`.** These extension types have no JavaScript type of their own and
-  decode to `Date` (or `Timestamp`). @btoon/js doesn't write them: `Date` and `Timestamp`
-  encode as timestamps (-1), and a raw `Ext` can't carry their ids (see the next note).
+- **`date` and `datetime`.** JavaScript has no types for these, so @btoon/js provides
+  `BtoonDate` and `BtoonDateTime` (spec 0.3 §10). Both are subclasses of `Timestamp` that hold
+  the exact value on the wire, `epochMilliseconds` or `epochNanoseconds` as a `bigint`; the
+  inherited `seconds` and `nanoseconds` describe the same instant, floored. With
+  `timestamps: 'object'`, decoding returns them, so a document re-encodes to the same bytes.
+  A `Date` still encodes as a timestamp (-1); convert with `BtoonDate.fromDate(date)`,
+  `BtoonDateTime.fromTimestamp(ts)` and `toDate()`:
+
+  ```js
+  import { BtoonDate, BtoonDateTime, Timestamp, decode, encode } from '@btoon/js';
+
+  encode(new BtoonDate(1700000000123n)); // d7 fe 0000018bcfe5687b
+  const bytes = encode(new BtoonDateTime(1700000000123456789n));
+  const at = decode(bytes, { timestamps: 'object' }); // BtoonDateTime, epochNanoseconds 1700000000123456789n
+  at instanceof Timestamp; // true
+  encode(at); // the same bytes again
+  decode(bytes); // a Date: 2023-11-14T22:13:20.123Z
+  ```
 - **`Ext` with an id BTOON defines.** Since spec 0.2, `encode` throws `invalid_argument` for
   an `Ext` whose id is one BTOON defines (-1…-6 for timestamp, date, datetime, bigint and
   the vectors, -10 for tabular), even when its payload is valid (SPEC §5.7). Written
@@ -189,15 +212,20 @@ Notes:
   their typed values. The `Ext` constructor still accepts these ids, as in the other BTOON
   libraries. Ids reserved for future versions (-7…-9, -11…-128) are written as given.
 - **Cycles** throw `max_depth`, like any value nested deeper than `maxDepth`.
-- `Ext` and `Timestamp` are recognised through `Symbol.for('btoon.Ext')` and
-  `Symbol.for('btoon.Timestamp')` brands, so instances from the ESM and CommonJS builds
-  (or two copies of the package) are interchangeable.
+- **`instanceof`.** `Ext`, `Timestamp`, `BtoonDate`, `BtoonDateTime` and `BtoonError`
+  carry `Symbol.for('btoon.…')` brands, and `instanceof` checks those
+  (`Symbol.hasInstance`). So instances from the ESM and CommonJS builds, two copies of the
+  package, another realm or the native `btoon` package are interchangeable, for the encoder
+  and for `instanceof`. A subclass you write keeps the ordinary `instanceof`.
+- **Shared memory.** `decode` copies input that lives in a `SharedArrayBuffer` once before
+  reading it, so the signature it verifies covers the bytes it parses. (Browsers'
+  `TextDecoder` also refuses views of shared memory.)
 
 ## API
 
 ```ts
-const VERSION: '0.2.0';
-const SPEC_VERSION: '0.2';
+const VERSION: '0.3.0';
+const SPEC_VERSION: '0.3';
 
 function encode(value: unknown, options?: EncodeOptions): Uint8Array;
 function decode(data: Uint8Array | ArrayBuffer | ArrayBufferView, options?: DecodeOptions): unknown;
@@ -207,12 +235,28 @@ function decodeAsync(data: Uint8Array | ArrayBuffer | ArrayBufferView, options?:
 class BtoonError extends Error { readonly code: BtoonErrorCode }
 class Ext { constructor(readonly type: number, readonly data: Uint8Array) }
 class Timestamp {
-  constructor(seconds: bigint | number, nanoseconds: number, offsetMinutes?: number);
+  constructor(seconds: bigint | number, nanoseconds?: number /* = 0 */, offsetMinutes?: number);
   readonly seconds: bigint; readonly nanoseconds: number; readonly offsetMinutes?: number;
   toDate(): Date;
   static fromDate(date: Date): Timestamp;
 }
+class BtoonDate extends Timestamp {      // date (-2): i64 milliseconds since the epoch, UTC
+  constructor(epochMilliseconds: bigint | number);
+  readonly epochMilliseconds: bigint;
+  static fromDate(date: Date): BtoonDate;
+  static fromTimestamp(ts: Timestamp): BtoonDate;      // floors to the millisecond
+}
+class BtoonDateTime extends Timestamp {  // datetime (-3): i64 nanoseconds since the epoch, UTC
+  constructor(epochNanoseconds: bigint | number);
+  readonly epochNanoseconds: bigint;
+  static fromDate(date: Date): BtoonDateTime;
+  static fromTimestamp(ts: Timestamp): BtoonDateTime;  // exact
+}
 ```
+
+The constructors take a `bigint`, or a `number` that is a safe integer, in the signed 64-bit
+range; anything else throws `invalid_argument`. `fromTimestamp` throws `invalid_argument`
+for a `Timestamp` with a UTC offset (dates and datetimes have none) or one out of range.
 
 `encode` returns `Uint8Array<ArrayBuffer>`; the type definitions need TypeScript 5.7 or
 later (or `skipLibCheck`). `decodeAsync` copies its input first, so the caller may reuse
@@ -239,8 +283,8 @@ the buffer right away. The async functions report every failure as a rejected pr
 | `maxValues` | 1,048,576 (2^20) | Largest number of values a document may decode to. See [Limits](#limits). |
 | `autoDecompress` | `true` | Accept compression envelopes; `false` rejects them with `invalid_envelope`. |
 | `hmacKey` | none | Require a signed envelope and verify it before parsing. An empty key or `null` throws `invalid_argument`: leave the option out for no key. |
-| `timestamps` | `'date'` | `'date'` or `'object'` (always `Timestamp`, full precision). |
-| `bigint` | `'auto'` | `'auto'` or `'always'`. |
+| `timestamps` | `'date'` | `'date'` (`Date`) or `'object'` (lossless: `Timestamp`, `BtoonDate`, `BtoonDateTime`). |
+| `bigint` | `'auto'` | `'auto'` (`bigint` outside [-(2^53-1), 2^53-1]) or `'always'` (`bigint` outside [-2^31, 2^32-1]). |
 | `codecs` | none | Caller-supplied compression codecs. |
 
 Invalid options throw `invalid_argument`, before any input is read. Unknown option names
@@ -325,16 +369,15 @@ the ESM and CommonJS builds of both entry points, synchronously and asynchronous
 each vector's options: every non-error vector must decode to its value (float vectors bit
 for bit), every canonical vector must re-encode byte-for-byte, every error vector must fail
 with its error code, and every `encode_error` vector's value must be refused with its code.
-All 298 pass, with these exceptions:
+Canonical vectors are also decoded with `timestamps: 'object'` and encoded again, which must
+give the same bytes. All 311 pass, with these exceptions:
 
-- Seven canonical vectors are decoded and checked but not re-encoded, as SPEC §10 allows
-  for values an implementation has no native type for: `float/0` (the float `0.0` is the
-  integer `0` in JavaScript), and the five `date/*` and `datetime/*` vectors and
-  `tabular/type-code-9-variants` (JavaScript has no date or datetime type, and SPEC §5.7
-  forbids writing their ids raw).
-- Vectors that need an optional codec are skipped where it is missing: LZ4 everywhere;
-  Brotli and Zstandard in the portable entry without `codecs` (and Zstandard on
-  Node.js < 22.15).
+- `float/0` is decoded and checked but not re-encoded, as SPEC §10 allows for a value the
+  language can't represent distinctly: the float `0.0` is the integer `0` in JavaScript.
+  Dates and datetimes re-encode from `BtoonDate` and `BtoonDateTime`.
+- Vectors that need an optional codec are skipped where it is missing: LZ4 everywhere
+  (including the `lz4-block/*` end-of-block cases); Brotli and Zstandard in the portable
+  entry without `codecs` (and Zstandard on Node.js < 22.15).
 
 ## Performance
 
@@ -350,8 +393,8 @@ entry). Throughput is relative to the BTOON size. JSON figures are for compariso
 The portable entry measured up to 6% slower than these numbers on the same machine.
 
 Bundle size of the portable ESM entry with everything imported, bundled with esbuild
-0.28.2 (`--minify`): 44.1 KB, 14.7 KB gzipped. An application that imports only `decode`
-bundles 25.9 KB (9.4 KB gzipped).
+0.28.2 (`--minify`): 50.7 KB, 16.5 KB gzipped. An application that imports only `decode`
+bundles 30.7 KB (10.6 KB gzipped).
 
 ## Development
 

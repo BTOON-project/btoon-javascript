@@ -1,6 +1,8 @@
 // Compile-only: exercises the published .d.ts files the way a consumer would. Checked by
 // test/package.test.mjs with `moduleResolution` NodeNext and Bundler.
 import {
+  BtoonDate,
+  BtoonDateTime,
   BtoonError,
   Ext,
   SPEC_VERSION,
@@ -19,8 +21,8 @@ import {
   type EncodeOptions,
 } from '@btoon/js';
 
-const version: '0.2.0' = VERSION;
-const spec: '0.2' = SPEC_VERSION;
+const version: '0.3.0' = VERSION;
+const spec: '0.3' = SPEC_VERSION;
 
 const bytes: Uint8Array<ArrayBuffer> = encode({ a: 1, b: [true, null], when: new Date() });
 // The result is a plain ArrayBuffer-backed view, usable wherever a BufferSource is expected.
@@ -83,6 +85,7 @@ const err = new BtoonError('invalid_argument', 'x', { cause: new Error('inner') 
 
 const ts = new Timestamp(1704067200n, 500, -330);
 const ts2 = new Timestamp(0, 0);
+const ts3 = new Timestamp(5n); // nanoseconds default to 0
 const seconds: bigint = ts.seconds;
 const nanos: number = ts.nanoseconds;
 const offset: number | undefined = ts.offsetMinutes;
@@ -92,7 +95,39 @@ const ext = new Ext(42, new Uint8Array([1, 2, 3]));
 const extType: number = ext.type;
 const extData: Uint8Array = ext.data;
 
+// Typed date (-2) and datetime (-3) values: Timestamps with an exact epoch value.
+const day = new BtoonDate(1700000000123n);
+const dayMs: bigint = day.epochMilliseconds;
+const dayAsTimestamp: Timestamp = day;
+const dayDate: Date = BtoonDate.fromDate(new Date(0)).toDate();
+const dayFromTs: BtoonDate = BtoonDate.fromTimestamp(ts2);
+const at = new BtoonDateTime(-1);
+const atNs: bigint = at.epochNanoseconds;
+const atFromDate: BtoonDateTime = BtoonDateTime.fromDate(new Date(0));
+const atFromTs: BtoonDateTime = BtoonDateTime.fromTimestamp(day);
+encode([day, at, ts]);
+// @ts-expect-error: the epoch value is a bigint or a number
+new BtoonDate('1700000000123');
+
+function describe(v: unknown): string {
+  // instanceof narrows through Symbol.hasInstance.
+  if (v instanceof BtoonDateTime) return `datetime ${v.epochNanoseconds}`;
+  if (v instanceof BtoonDate) return `date ${v.epochMilliseconds}`;
+  if (v instanceof Timestamp) return `timestamp ${v.seconds}`;
+  if (v instanceof Ext) return `ext ${v.type}`;
+  return typeof v;
+}
+
 export {
+  atFromDate,
+  atFromTs,
+  atNs,
+  dayAsTimestamp,
+  dayDate,
+  dayFromTs,
+  dayMs,
+  describe,
+  ts3,
   badAlgorithm,
   badLimit,
   badMode,

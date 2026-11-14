@@ -20,7 +20,7 @@ import {
   type DecodeOptions,
   type EncodeOptions,
 } from './options.js';
-import { isUint8Array } from './values.js';
+import { bufferBytes, isUint8Array, viewBuffer, viewBytes } from './values.js';
 import {
   mayDecompressAsync,
   subtle,
@@ -52,21 +52,45 @@ export type BinaryInput = Uint8Array | ArrayBuffer | ArrayBufferView;
 const COMPRESSED_MAGIC = [0x42, 0x54, 0x4f, 0x4e]; // "BTON"
 const SIGNED_MAGIC = [0x42, 0x54, 0x53, 0x47]; // "BTSG"
 const SIGNED_HEADER = new Uint8Array([0x42, 0x54, 0x53, 0x47, 1, 1, 0, 0]);
-const objectToString = Object.prototype.toString;
 
 function hasMagic(b: Uint8Array, magic: readonly number[]): boolean {
   return b.length >= 4 && b[0] === magic[0] && b[1] === magic[1] && b[2] === magic[2] && b[3] === magic[3];
 }
 
-function inputBytes(data: unknown): Uint8Array {
-  if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-  const tag = objectToString.call(data);
-  if (tag === '[object ArrayBuffer]' || tag === '[object SharedArrayBuffer]') return new Uint8Array(data as ArrayBuffer);
-  throw fail('invalid_argument', 'decode() expects a Uint8Array, ArrayBuffer or other ArrayBufferView');
+const getter = (proto: object, name: string): ((this: unknown) => unknown) =>
+  Object.getOwnPropertyDescriptor(proto, name)!.get as (this: unknown) => unknown;
+const arrayBufferLength = getter(ArrayBuffer.prototype, 'byteLength');
+const sharedArrayBufferLength = typeof SharedArrayBuffer === 'function' ? getter(SharedArrayBuffer.prototype, 'byteLength') : undefined;
+
+/** True if `v` is an ArrayBuffer (`shared` false) or a SharedArrayBuffer (`shared` true) of any realm. */
+function isBuffer(v: unknown, shared: boolean): boolean {
+  const length = shared ? sharedArrayBufferLength : arrayBufferLength;
+  if (length === undefined) return false;
+  try {
+    length.call(v);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
-function isShared(b: Uint8Array): boolean {
-  return typeof SharedArrayBuffer !== 'undefined' && b.buffer instanceof SharedArrayBuffer;
+/**
+ * The bytes of decode's input. Input in shared memory is copied once, so that a signature is
+ * verified on the bytes that are then parsed (another thread can change shared memory in
+ * between), and because browsers' TextDecoder refuses views of a SharedArrayBuffer.
+ */
+function inputBytes(data: unknown): Uint8Array {
+  let bytes: Uint8Array;
+  let buffer: unknown = data;
+  if (ArrayBuffer.isView(data)) {
+    bytes = viewBytes(data);
+    buffer = viewBuffer(data);
+  } else if (isBuffer(data, false) || isBuffer(data, true)) {
+    bytes = bufferBytes(data);
+  } else {
+    throw fail('invalid_argument', 'decode() expects a Uint8Array, ArrayBuffer or other ArrayBufferView');
+  }
+  return isBuffer(buffer, true) ? bytes.slice() : bytes;
 }
 
 function isThenable(v: unknown): v is PromiseLike<unknown> {
@@ -260,7 +284,6 @@ export function decodeWith(data: BinaryInput, options: DecodeOptions | undefined
   const cfg = decodeConfig(options);
   let bytes = inputBytes(data);
   if (cfg.hmacKey !== undefined) {
-    if (isShared(bytes)) bytes = bytes.slice(); // verify and parse the same bytes
     const env = signedEnvelope(bytes);
     const expected = platform.hmac(cfg.hmacKey, [env.header, env.payload]);
     if (!platform.equal(expected, env.mac)) throw fail('authentication_failed', 'HMAC verification failed');

@@ -2,6 +2,8 @@
 // tabular payloads and column lengths are back-patched.
 import {
   EXT_BIGINT,
+  EXT_DATE,
+  EXT_DATETIME,
   EXT_F32_VECTOR,
   EXT_F64_VECTOR,
   EXT_TABULAR,
@@ -12,7 +14,21 @@ import {
 } from './constants.js';
 import { fail, isStackOverflow } from './errors.js';
 import { compareUtf8, isWellFormed, loneSurrogateError, textEncoder, utf8Length } from './utf8.js';
-import { dateTime, isExt, isTimestamp, isUint8Array, type Ext, type Timestamp } from './values.js';
+import {
+  dateTime,
+  isBtoonDate,
+  isBtoonDateTime,
+  isExt,
+  isTimestamp,
+  isUint8Array,
+  typedArrayType,
+  bufferBytes,
+  viewBytes,
+  type BtoonDate,
+  type BtoonDateTime,
+  type Ext,
+  type Timestamp,
+} from './values.js';
 
 const TWO_32 = 4294967296;
 const TWO_34 = 17179869184;
@@ -21,22 +37,39 @@ const INT64_MIN = -(1n << 63n);
 const INT63 = 1n << 63n;
 const LITTLE_ENDIAN = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
 
-// Object kinds, in the order the encoder tests for them.
+// Object kinds. The native `btoon` package classifies with the same numbers (index.js), so
+// keep the two in step.
 const K_ARRAY = 1;
+/** Prototype Object.prototype or null, without an own toJSON(). */
 const K_PLAIN = 2;
 const K_VIEW = 3;
 const K_BUFFER = 4;
 const K_DATE = 5;
+/** A Map (any realm, subclasses included): read with the intrinsic Map methods. */
 const K_MAP = 6;
 const K_TIMESTAMP = 7;
 const K_EXT = 8;
+/** An object with toJSON(): a class's, or a plain object's own. */
 const K_TOJSON = 9;
 /** A Number, String, Boolean or BigInt wrapper object (unwrapped, as JSON.stringify does). */
 const K_BOXED = 10;
 /** Any other object: encoded like JSON.stringify, as a map of its own enumerable string keys. */
 const K_OBJECT = 11;
+/** A BtoonDate (extension -2). */
+const K_BTOON_DATE = 12;
+/** A BtoonDateTime (extension -3). */
+const K_BTOON_DATETIME = 13;
+/**
+ * Inherits from Map.prototype without being a Map: a Proxy of one, such as Vue's and MobX's
+ * reactive Maps. Read through its own keys() and get(), which those proxies forward to the Map.
+ */
+const K_PROXY_MAP = 14;
 
 const objectToString = Object.prototype.toString;
+const hasOwn = Object.prototype.hasOwnProperty;
+const mapSize = Object.getOwnPropertyDescriptor(Map.prototype, 'size')!.get!;
+const mapKeysOf = Map.prototype.keys;
+const mapGet = Map.prototype.get;
 const NOT_BOXED: unique symbol = Symbol('not boxed');
 const BOXES = new Map<string, { valueOf(): unknown }>([
   ['[object Number]', Number.prototype],
@@ -56,19 +89,37 @@ function unbox(o: object, tag: string = objectToString.call(o)): unknown {
   }
 }
 
+/** True for a Map of any realm (it has [[MapData]]); false for a Proxy of one. */
+function isMap(o: object): boolean {
+  try {
+    mapSize.call(o);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A plain object's own toJSON(), which JSON.stringify calls. An inherited one, such as a
+ * polluted Object.prototype.toJSON, is ignored.
+ */
+function ownToJSON(o: object): boolean {
+  return typeof (o as { toJSON?: unknown }).toJSON === 'function' && hasOwn.call(o, 'toJSON');
+}
+
 function classify(o: object): number {
   if (Array.isArray(o)) return K_ARRAY;
   const proto: unknown = Object.getPrototypeOf(o);
-  if (proto === Object.prototype || proto === null) return K_PLAIN;
+  if (proto === Object.prototype || proto === null) return ownToJSON(o) ? K_TOJSON : K_PLAIN;
   if (ArrayBuffer.isView(o)) return K_VIEW;
   if (o instanceof Date) return K_DATE;
-  if (o instanceof Map) return K_MAP;
-  if (isTimestamp(o)) return K_TIMESTAMP;
+  if (o instanceof Map) return isMap(o) ? K_MAP : K_PROXY_MAP;
+  if (isTimestamp(o)) return isBtoonDateTime(o) ? K_BTOON_DATETIME : isBtoonDate(o) ? K_BTOON_DATE : K_TIMESTAMP;
   if (isExt(o)) return K_EXT;
   const tag = objectToString.call(o);
   if (tag === '[object ArrayBuffer]' || tag === '[object SharedArrayBuffer]') return K_BUFFER;
   if (tag === '[object Date]') return K_DATE; // from another realm
-  if (tag === '[object Map]') return K_MAP; // from another realm
+  if (tag === '[object Map]' && isMap(o)) return K_MAP; // from another realm
   if (typeof (o as { toJSON?: unknown }).toJSON === 'function') return K_TOJSON;
   if (unbox(o, tag) !== NOT_BOXED) return K_BOXED;
   return K_OBJECT; // class instances, and plain objects from another realm
@@ -77,8 +128,8 @@ function classify(o: object): number {
 /** What to encode instead of a raw `Ext` with a BTOON-defined id, indexed by -id. */
 const TYPED_INSTEAD: Record<number, string> = {
   1: 'encode a Date or Timestamp',
-  2: 'JavaScript has no date type, so encode a Date or Timestamp (a timestamp) instead',
-  3: 'JavaScript has no datetime type, so encode a Date or Timestamp (a timestamp) instead',
+  2: 'encode a BtoonDate',
+  3: 'encode a BtoonDateTime',
   4: 'encode a bigint',
   5: 'encode a Float32Array',
   6: 'encode a Float64Array',
@@ -89,17 +140,27 @@ function maxDepthError(): Error {
   return fail('max_depth', 'maximum nesting depth exceeded (or the value is cyclic)');
 }
 
+/**
+ * The keys of a Map, or null if one isn't a string. A Map's keys are read with the intrinsic
+ * Map.prototype.keys, so a subclass's own iterator can't repeat one. A proxied Map's come from
+ * its own keys(), which must not repeat one either.
+ */
+function stringKeys(m: Map<unknown, unknown>, kind: number): string[] | null {
+  const keys: string[] = [];
+  for (const k of kind === K_MAP ? mapKeysOf.call(m) : m.keys()) {
+    if (typeof k !== 'string') return null;
+    keys.push(k);
+  }
+  if (kind === K_PROXY_MAP && keys.length > 1 && new Set(keys).size !== keys.length) {
+    throw fail('invalid_argument', 'a Map yielded the same key twice');
+  }
+  return keys;
+}
+
 /** Keys of a value that encodes as a map, or null. Non-string Map keys → null. */
 function mapKeys(v: unknown, kind: number): string[] | null {
   if (kind === K_PLAIN || kind === K_OBJECT) return Object.keys(v as object);
-  if (kind === K_MAP) {
-    const keys: string[] = [];
-    for (const k of Map.prototype.keys.call(v as Map<unknown, unknown>)) {
-      if (typeof k !== 'string') return null;
-      keys.push(k);
-    }
-    return keys;
-  }
+  if (kind === K_MAP || kind === K_PROXY_MAP) return stringKeys(v as Map<unknown, unknown>, kind);
   return null;
 }
 
@@ -111,49 +172,70 @@ function callToJSON(o: object): unknown {
   return (o as { toJSON(): unknown }).toJSON();
 }
 
-function cell(row: unknown, kind: number, key: string): unknown {
-  return kind === K_MAP ? Map.prototype.get.call(row as Map<unknown, unknown>, key) : (row as Record<string, unknown>)[key];
+/** The value of a map-like value at `key`; `kind` is its kind. */
+function entry(m: unknown, kind: number, key: string): unknown {
+  if (kind === K_MAP) return mapGet.call(m as Map<unknown, unknown>, key);
+  if (kind === K_PROXY_MAP) return (m as Map<unknown, unknown>).get(key);
+  return (m as Record<string, unknown>)[key];
 }
 
-/** SPEC §5.6.1 type code of a (resolved) value: the logical type of the first row's cell. */
-function typeCode(v: unknown): number {
-  switch (typeof v) {
-    case 'undefined':
+/**
+ * SPEC §5.6.1 type code of the value whose canonical encoding starts at `buf[p]`: the logical
+ * type, read off the encoding as the spec says (and as btoon-core does). A tabular extension
+ * is an array (7); every other extension is 9.
+ */
+function typeCodeAt(buf: Uint8Array, p: number): number {
+  const m = buf[p]!;
+  if (m <= 0x7f || m >= 0xe0) return 2; // fixints
+  if (m <= 0x8f) return 8; // fixmap
+  if (m <= 0x9f) return 7; // fixarray
+  if (m <= 0xbf) return 5; // fixstr
+  const ext = (typeAt: number): number => (buf[p + typeAt] === (EXT_TABULAR & 0xff) ? 7 : 9);
+  switch (m) {
+    case 0xc0:
       return 0;
-    case 'boolean':
+    case 0xc2:
+    case 0xc3:
       return 1;
-    case 'number':
-      return Number.isSafeInteger(v) && (v !== 0 || 1 / v > 0) ? 2 : 4;
-    case 'bigint':
-      if (v >= INT64_MIN && v < INT63) return 2;
-      if (v >= INT63 && v <= UINT64_MAX) return 3;
-      return 9;
-    case 'string':
+    case 0xc4:
+    case 0xc5:
+    case 0xc6:
+      return 6;
+    case 0xca:
+    case 0xcb:
+      return 4;
+    case 0xcf:
+      return buf[p + 1]! >= 0x80 ? 3 : 2; // above 2^63 - 1
+    case 0xcc:
+    case 0xcd:
+    case 0xce:
+    case 0xd0:
+    case 0xd1:
+    case 0xd2:
+    case 0xd3:
+      return 2;
+    case 0xd9:
+    case 0xda:
+    case 0xdb:
       return 5;
-    case 'object': {
-      if (v === null) return 0;
-      switch (classify(v)) {
-        case K_ARRAY:
-          return 7;
-        case K_PLAIN:
-        case K_MAP:
-        case K_OBJECT:
-        case K_TOJSON: // a toJSON() result that has toJSON() itself: encoded by its own properties
-          return 8;
-        case K_BOXED:
-          return typeCode(unbox(v));
-        case K_EXT: // never a BTOON-defined id such as tabular: the encoder rejects those
-          return 9;
-        case K_BUFFER:
-          return 6;
-        case K_VIEW: {
-          const tag = (v as { [Symbol.toStringTag]?: unknown })[Symbol.toStringTag];
-          return tag === 'Float32Array' || tag === 'Float64Array' ? 9 : 6;
-        }
-        default:
-          return 9;
-      }
-    }
+    case 0xdc:
+    case 0xdd:
+      return 7;
+    case 0xde:
+    case 0xdf:
+      return 8;
+    case 0xd4:
+    case 0xd5:
+    case 0xd6:
+    case 0xd7:
+    case 0xd8:
+      return ext(1);
+    case 0xc7:
+      return ext(2);
+    case 0xc8:
+      return ext(3);
+    case 0xc9:
+      return ext(5);
     default:
       return 9;
   }
@@ -180,6 +262,7 @@ function bigintBytes(v: bigint): Uint8Array {
 }
 
 interface TabularPlan {
+  /** The rows as planned, toJSON() results in place of their objects. */
   rows: readonly unknown[];
   kinds: Uint8Array;
   keys: string[];
@@ -279,16 +362,23 @@ class Encoder {
         this.arrayBufferView(o as ArrayBufferView);
         return;
       case K_BUFFER:
-        this.binary(new Uint8Array(o as ArrayBuffer));
+        this.binary(bufferBytes(o));
         return;
       case K_DATE:
         this.timestampMs(dateTime(o));
         return;
       case K_MAP:
-        this.mapObject(o as Map<unknown, unknown>, depth);
+      case K_PROXY_MAP:
+        this.mapObject(o as Map<unknown, unknown>, kind, depth);
         return;
       case K_TIMESTAMP:
         this.timestamp(o as Timestamp);
+        return;
+      case K_BTOON_DATE:
+        this.btoonDate(o as BtoonDate);
+        return;
+      case K_BTOON_DATETIME:
+        this.btoonDateTime(o as BtoonDateTime);
         return;
       case K_EXT:
         this.ext(o as Ext);
@@ -521,8 +611,8 @@ class Encoder {
   }
 
   private arrayBufferView(v: ArrayBufferView): void {
-    const tag = (v as { [Symbol.toStringTag]?: unknown })[Symbol.toStringTag];
-    const raw = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+    const tag = typedArrayType(v);
+    const raw = viewBytes(v);
     if (tag === 'Float32Array' || tag === 'Float64Array') {
       // SPEC §5.5: little-endian payload, NaN bits untouched.
       const n = raw.length;
@@ -607,8 +697,36 @@ class Encoder {
       throw fail('invalid_argument', `Ext type ${type} is defined by BTOON and can't be written raw (SPEC §5.7); ${TYPED_INSTEAD[-type]}`);
     }
     if (!isUint8Array(data)) throw fail('invalid_argument', 'Ext data must be a Uint8Array');
-    this.extHeader(type, data.byteLength);
-    this.bytes(data);
+    const payload = viewBytes(data); // its real bytes: a subclass can't misreport its length
+    this.extHeader(type, payload.length);
+    this.bytes(payload);
+  }
+
+  // --- date and datetime (SPEC §5.2, §5.3): fixext 8, i64 big-endian ---------------------
+
+  private btoonDate(d: BtoonDate): void {
+    const ms = d.epochMilliseconds;
+    if (typeof ms !== 'bigint' || ms < INT64_MIN || ms >= INT63) {
+      throw fail('invalid_argument', 'BtoonDate epochMilliseconds must be a bigint in the int64 range');
+    }
+    this.fixext8(EXT_DATE, ms);
+  }
+
+  private btoonDateTime(d: BtoonDateTime): void {
+    const ns = d.epochNanoseconds;
+    if (typeof ns !== 'bigint' || ns < INT64_MIN || ns >= INT63) {
+      throw fail('invalid_argument', 'BtoonDateTime epochNanoseconds must be a bigint in the int64 range');
+    }
+    this.fixext8(EXT_DATETIME, ns);
+  }
+
+  private fixext8(type: number, v: bigint): void {
+    this.ensure(10);
+    const p = this.pos;
+    this.buf[p] = 0xd7;
+    this.buf[p + 1] = type & 0xff;
+    this.view.setBigInt64(p + 2, v);
+    this.pos = p + 10;
   }
 
   // --- timestamps (SPEC §5.1) -------------------------------------------------------
@@ -735,30 +853,31 @@ class Encoder {
     }
   }
 
-  private mapObject(m: Map<unknown, unknown>, depth: number): void {
+  private mapObject(m: Map<unknown, unknown>, kind: number, depth: number): void {
     if (depth >= this.maxDepth) throw maxDepthError();
-    const keys: string[] = [];
-    for (const k of Map.prototype.keys.call(m)) {
-      if (typeof k !== 'string') throw fail('invalid_argument', 'Map keys must be strings');
-      keys.push(k);
-    }
+    const keys = stringKeys(m, kind);
+    if (keys === null) throw fail('invalid_argument', 'Map keys must be strings');
     const n = keys.length;
     if (n > 1) keys.sort(compareUtf8);
     this.mapHeader(n);
     for (let i = 0; i < n; i++) {
       const k = keys[i]!;
       this.string(k);
-      this.value(Map.prototype.get.call(m, k), depth + 1);
+      this.value(entry(m, kind, k), depth + 1);
     }
   }
 
   private array(arr: readonly unknown[], depth: number): void {
     if (depth >= this.maxDepth) throw maxDepthError();
     const n = arr.length;
+    // Only a Proxy of an array can report another length.
+    if (!Number.isInteger(n) || n < 0 || n > 0xffffffff) {
+      throw fail('invalid_argument', 'an array length must be an integer in [0, 2^32-1]');
+    }
     let items = arr;
     let resolvedUpTo = 0;
     if (this.autoTabular && n >= 2) {
-      const plan = this.planTabular(arr);
+      const plan = this.planTabular(arr, n);
       if (plan !== null) {
         this.tabular(plan, depth);
         return;
@@ -776,25 +895,27 @@ class Encoder {
 
   /**
    * SPEC §5.6.2: qualification and size rule. Elements with toJSON() are resolved here
-   * (once); when the array is not tabular, `items[0..resolvedUpTo)` holds the elements
-   * already resolved so the plain path doesn't call toJSON() twice.
+   * (once). The plan keeps the rows it checked, and the table is written from those: code
+   * that runs while it is written (getters, toJSON()) can't swap or remove a row. When the
+   * array is not tabular, `items[0..resolvedUpTo)` holds the elements already resolved so the
+   * plain path doesn't call toJSON() twice.
    */
-  private planTabular(arr: readonly unknown[]): TabularPlan | null {
-    const n = arr.length;
-    let resolved: unknown[] | null = null;
-    let kinds: Uint8Array | null = null; // allocated once the first element qualifies
+  private planTabular(arr: readonly unknown[], n: number): TabularPlan | null {
+    // Both allocated once the first element qualifies (or has toJSON()).
+    let rows: unknown[] | null = null;
+    let kinds: Uint8Array | null = null;
+    let resolvedAny = false;
     let firstKeys: string[] = [];
     let keySet: Set<string> | null = null;
     for (let i = 0; i < n; i++) {
       let row = arr[i];
       let kind = kindOf(row);
       if (kind === K_TOJSON) {
-        if (resolved === null) resolved = arr.slice(0, i);
         row = callToJSON(row as object);
         kind = kindOf(row);
         if (kind === K_TOJSON) kind = K_OBJECT; // no second toJSON()
+        resolvedAny = true;
       }
-      if (resolved !== null) resolved[i] = row;
       const keys = mapKeys(row, kind);
       let ok = keys !== null;
       if (ok) {
@@ -818,7 +939,12 @@ class Encoder {
           }
         }
       }
-      if (!ok) return this.decline(arr, resolved, i + 1);
+      if (ok || resolvedAny) {
+        // Every earlier element qualified, so `rows` exists unless this is the first.
+        if (rows === null) rows = new Array<unknown>(n);
+        rows[i] = row;
+      }
+      if (!ok) return this.decline(arr, resolvedAny ? rows : null, i + 1);
       if (kinds === null) kinds = new Uint8Array(n);
       kinds[i] = kind;
     }
@@ -834,8 +960,8 @@ class Encoder {
       overhead += 9 + len;
     }
     // N * perRow > overhead  <=>  perRow > floor(overhead / N)
-    if (perRow <= Math.floor(overhead / n)) return this.decline(arr, resolved, n);
-    return { rows: resolved ?? arr, kinds: kinds!, keys, lens };
+    if (perRow <= Math.floor(overhead / n)) return this.decline(arr, resolvedAny ? rows : null, n);
+    return { rows: rows!, kinds: kinds!, keys, lens };
   }
 
   private decline(arr: readonly unknown[], resolved: unknown[] | null, upTo: number): null {
@@ -863,29 +989,17 @@ class Encoder {
       this.pos += 4;
       this.utf8Exact(keys[k]!, lens[k]!);
     }
-    // Type codes describe the first row; resolve its cells once and reuse them below.
-    const first = rows[0];
-    const firstKind = kinds[0]!;
-    const firstCells = new Array<unknown>(c);
-    const firstResolved = new Uint8Array(c);
+    // Type codes describe the first row; they are read off its cells' encodings below.
+    const codes = this.pos;
     this.ensure(c);
-    for (let k = 0; k < c; k++) {
-      let v = cell(first, firstKind, keys[k]!);
-      if (kindOf(v) === K_TOJSON) {
-        v = callToJSON(v as object);
-        firstResolved[k] = 1;
-      }
-      firstCells[k] = v;
-      this.buf[this.pos++] = typeCode(v);
-    }
+    this.pos += c;
     for (let k = 0; k < c; k++) {
       const key = keys[k]!;
       this.ensure(4);
       const lenPos = this.pos;
       this.pos += 4;
-      if (firstResolved[k] === 1) this.resolved(firstCells[k], depth + 2);
-      else this.value(firstCells[k], depth + 2);
-      for (let r = 1; r < n; r++) this.value(cell(rows[r], kinds[r]!, key), depth + 2);
+      for (let r = 0; r < n; r++) this.value(entry(rows[r], kinds[r]!, key), depth + 2);
+      this.buf[codes + k] = typeCodeAt(this.buf, lenPos + 4);
       const colLen = this.pos - lenPos - 4;
       if (colLen > 0xffffffff) throw fail('size_limit', 'tabular column larger than 2^32-1 bytes');
       this.view.setUint32(lenPos, colLen);
